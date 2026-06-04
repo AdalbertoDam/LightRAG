@@ -48,6 +48,13 @@ from lightrag.utils import (
     generate_track_id,
     move_file_to_parsed_dir,
 )
+from lightrag.tracing import (
+    lf_start_as_current_observation,
+    lf_propagate_attributes,
+    lf_flush,
+    lf_observe,
+    lf_update_current_span,
+)
 from lightrag.api.utils_api import get_combined_auth_dependency
 from ..config import global_args
 
@@ -2671,12 +2678,22 @@ async def run_scanning_process(
             # selects work by doc_status state and so will also pick up any
             # resume_files in the same run.
             if new_files:
-                await pipeline_index_files(
-                    rag,
-                    new_files,
-                    track_id,
-                    from_scan=True,
-                )
+                async with lf_start_as_current_observation(
+                    name="scan-indexing",
+                    as_type="span",
+                    metadata={"files": new_files, "track_id": track_id, "files_status": "new", "workspace": rag.workspace},
+                ):
+                    async with lf_propagate_attributes(
+                        trace_name="documents/scan",
+                        tags=["scan", "indexing"],
+                        metadata={"files": new_files, "track_id": track_id, "files_status": "new", "workspace": rag.workspace},
+                    ):
+                        await pipeline_index_files(
+                            rag,
+                            new_files,
+                            track_id,
+                            from_scan=True,
+                        )
 
             # Resume targets must always trigger the pipeline explicitly:
             # pipeline_index_files only runs apipeline_process_enqueue_documents
@@ -2687,7 +2704,18 @@ async def run_scanning_process(
             # enqueue, the inner call already drained the queue and this is a
             # cheap no-op that returns "No documents to process".
             if resume_files:
-                await rag.apipeline_process_enqueue_documents()
+                async with lf_start_as_current_observation(
+                    name="scan_indexing",
+                    as_type="span",
+                    metadata={"files": new_files, "track_id": track_id, "files_status": "resume", "workspace": rag.workspace},
+                ):
+                    async with lf_propagate_attributes(
+                        trace_name="documents/scan",
+                        tags=["scan", "indexing"],
+                        metadata={"files": new_files, "track_id": track_id, "files_status": "resume", "workspace": rag.workspace},
+                    ):
+                        
+                        await rag.apipeline_process_enqueue_documents()
 
             total_active = len(new_files) + len(resume_files)
             if total_active or processed_files:
@@ -3273,10 +3301,20 @@ def create_document_routes(
             # so concurrent uploads/inserts cooperate via the running
             # loop's request_pending mechanism.
             async def _indexing_task():
-                try:
-                    await pipeline_index_file(rag, file_path, track_id)
-                finally:
-                    await _release_enqueue_slot(rag)
+                    async with lf_propagate_attributes(
+                        tags=["upload", "indexing"],
+                        metadata={
+                            "document_count": "1",
+                            "file_name": safe_filename,
+                            "workspace": rag.workspace,
+                        },
+                        trace_name=f"documents/upload:{safe_filename}"
+                    ):
+                        try:
+                            await pipeline_index_file(rag, file_path, track_id)
+                        finally:
+                            await _release_enqueue_slot(rag)
+                            lf_flush()
 
             background_tasks.add_task(_indexing_task)
             # Ownership of the slot transferred to the bg task — the
@@ -3307,6 +3345,7 @@ def create_document_routes(
     @router.post(
         "/text", response_model=InsertResponse, dependencies=[Depends(combined_auth)]
     )
+    @lf_observe(name="insert-text", as_type="span")
     async def insert_text(
         request: InsertTextRequest, background_tasks: BackgroundTasks
     ):
@@ -3377,16 +3416,27 @@ def create_document_routes(
             track_id = generate_track_id("insert")
 
             async def _indexing_task():
-                try:
-                    await pipeline_index_texts(
-                        rag,
-                        [request.text],
-                        file_sources=[normalized_file_source],
-                        track_id=track_id,
-                        chunking=request.chunking,
-                    )
-                finally:
-                    await _release_enqueue_slot(rag)
+                async with lf_propagate_attributes(
+                    tags=["insert-text", "indexing"],
+                    metadata={
+                        "document_count": "1",
+                        "text_snippet": request.text[:10], 
+                        "file_source": normalized_file_source,
+                        "workspace": rag.workspace,
+                    },
+                    trace_name="documents/text"
+                ):
+                    try:
+                        await pipeline_index_texts(
+                            rag,
+                            [request.text],
+                            file_sources=[normalized_file_source],
+                            track_id=track_id,
+                            chunking=request.chunking,
+                        )
+                    finally:
+                        await _release_enqueue_slot(rag)
+                        lf_flush()
 
             background_tasks.add_task(_indexing_task)
             slot_reserved = False
@@ -3411,6 +3461,7 @@ def create_document_routes(
         response_model=InsertResponse,
         dependencies=[Depends(combined_auth)],
     )
+    @lf_observe(name="insert-texts", as_type="span")
     async def insert_texts(
         request: InsertTextsRequest, background_tasks: BackgroundTasks
     ):
@@ -3501,16 +3552,27 @@ def create_document_routes(
             track_id = generate_track_id("insert")
 
             async def _indexing_task():
-                try:
-                    await pipeline_index_texts(
-                        rag,
-                        request.texts,
-                        file_sources=normalized_file_sources,
-                        track_id=track_id,
-                        chunking=request.chunking,
-                    )
-                finally:
-                    await _release_enqueue_slot(rag)
+                async with lf_propagate_attributes(
+                    tags=["insert-texts", "indexing"],
+                    metadata={
+                        "document_count": len(request.texts),
+                        "file_sources": normalized_file_sources,
+                        "text_snippets": [text[:10] for text in request.texts],
+                        "workspace": rag.workspace,
+                    },
+                    trace_name="documents/texts"
+                ):
+                    try:
+                        await pipeline_index_texts(
+                            rag,
+                            request.texts,
+                            file_sources=normalized_file_sources,
+                            track_id=track_id,
+                            chunking=request.chunking,
+                        )
+                    finally:
+                        await _release_enqueue_slot(rag)
+                        lf_flush()
 
             background_tasks.add_task(_indexing_task)
             slot_reserved = False

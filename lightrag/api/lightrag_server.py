@@ -38,6 +38,7 @@ from .config import (
     resolve_asymmetric_embedding_opt_in,
     PREFIX_ASYMMETRIC_EMBEDDING_BINDINGS,
 )
+from lightrag.tracing import lf_shutdown, is_tracing_enabled
 from lightrag.utils import get_env_value
 from lightrag import LightRAG, ROLES, RoleLLMConfig, __version__ as core_version
 from lightrag.api import __api_version__
@@ -872,11 +873,16 @@ def create_app(args):
 
             ASCIIColors.green("\nServer is ready to accept connections! 🚀\n")
 
+            # Check Tracing status 
+            is_tracing_enabled()
             yield
 
         finally:
             # Clean up database connections
             await rag.finalize_storages()
+
+            # Shut down the Langfuse client (flushes + waits for background threads).
+            lf_shutdown()
 
             if "LIGHTRAG_GUNICORN_MODE" not in os.environ:
                 # Only perform cleanup in Uvicorn single-process mode

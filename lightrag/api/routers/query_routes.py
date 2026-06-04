@@ -7,8 +7,15 @@ from typing import Any, Dict, List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from lightrag.base import QueryParam
 from lightrag.api.utils_api import get_combined_auth_dependency
+from lightrag.tracing import (
+    lf_observe,
+    lf_propagate_attributes,
+    lf_flush,
+    lf_update_current_span,
+)
 from lightrag.utils import logger
 from pydantic import BaseModel, Field, field_validator
+from dataclasses import asdict
 
 
 class QueryRequest(BaseModel):
@@ -326,6 +333,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
+    @lf_observe(name="query-text", capture_input=False, capture_output=True)
     async def query_text(request: QueryRequest):
         """
         Comprehensive RAG query endpoint with non-streaming response. Parameter "stream" is ignored.
@@ -413,7 +421,16 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             param.stream = False
 
             # Unified approach: always use aquery_llm for both cases
-            result = await rag.aquery_llm(request.query, param=param)
+            async with lf_propagate_attributes(
+                tags=["query", f"query_mode:{request.mode}", f"streaming:{param.stream}"],
+                trace_name="query/query",
+                metadata={
+                    "query_mode": request.mode, 
+                    "streaming": param.stream,
+                    "workspace": rag.workspace,
+                }
+            ):
+                result = await rag.aquery_llm(request.query, param=param)
 
             # Extract LLM response and references from unified result
             llm_response = result.get("llm_response", {})
@@ -536,6 +553,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
+    @lf_observe(name="query-text-stream", capture_input=True, capture_output=False)
     async def query_text_stream(request: QueryRequest):
         """
         Advanced RAG query endpoint with flexible streaming response.
@@ -671,7 +689,16 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             from fastapi.responses import StreamingResponse
 
             # Unified approach: always use aquery_llm for all cases
-            result = await rag.aquery_llm(request.query, param=param)
+            async with lf_propagate_attributes(
+                tags=["query", f"query_mode:{request.mode}", f"streaming:{param.stream}"],
+                trace_name="query/stream",
+                metadata={
+                    "query_mode": request.mode,
+                    "streaming": str(param.stream),
+                    "workspace": rag.workspace,
+                }
+            ):
+                result = await rag.aquery_llm(request.query, param=param)
 
             async def stream_generator():
                 # Extract references and LLM response from unified result
@@ -1039,6 +1066,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
+    @lf_observe(name="query-data", capture_input=False, capture_output=True)
     async def query_data(request: QueryRequest):
         """
         Advanced data retrieval endpoint for structured RAG analysis.
@@ -1144,7 +1172,16 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
         """
         try:
             param = request.to_query_params(False)  # No streaming for data endpoint
-            response = await rag.aquery_data(request.query, param=param)
+            lf_update_current_span(
+                input={"query": request.query},
+                metadata=asdict(param),
+            )
+            async with lf_propagate_attributes(
+                tags=["retrieval", f"retrieval_mode:{request.mode}"],
+                metadata={"query_mode": request.mode, "workspace": rag.workspace},
+                trace_name="query/data",
+            ):
+                response = await rag.aquery_data(request.query, param=param)
 
             # aquery_data returns the new format with status, message, data, and metadata
             if isinstance(response, dict):

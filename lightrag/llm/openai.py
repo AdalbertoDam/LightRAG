@@ -30,6 +30,7 @@ from lightrag.utils import (
     safe_unicode_decode,
     logger,
 )
+from lightrag.tracing import is_tracing_enabled
 
 from lightrag.api import __api_version__
 
@@ -39,31 +40,22 @@ from typing import Any, Union
 
 from dotenv import load_dotenv
 
-# Try to import Langfuse for LLM observability (optional)
-# Falls back to standard OpenAI client if not available
-# Langfuse requires proper configuration to work correctly
-LANGFUSE_ENABLED = False
-try:
-    # Check if required Langfuse environment variables are set
-    langfuse_public_key = os.environ.get("LANGFUSE_PUBLIC_KEY")
-    langfuse_secret_key = os.environ.get("LANGFUSE_SECRET_KEY")
+from openai import AsyncOpenAI
 
-    # Only enable Langfuse if both keys are configured
-    if langfuse_public_key and langfuse_secret_key:
-        from langfuse.openai import AsyncOpenAI  # type: ignore[import-untyped]
+if is_tracing_enabled():
+    # Importing langfuse.openai triggers register_tracing(), which globally
+    # monkey-patches openai resource methods (chat, completions, embeddings)
+    # via wrapt.wrap_function_wrapper.  We want LLM calls to be traced but
+    # embedding calls to remain untraced (embedding tracing is handled via
+    # manual Langfuse spans in the EmbeddingFunc wrapper — see utils.py).
+    # After the import, restore the original (unwrapped) embedding methods.
+    import langfuse.openai  # noqa: F401 — side-effect: patches openai module
+    import openai.resources.embeddings as _emb_mod
 
-        LANGFUSE_ENABLED = True
-        logger.info("Langfuse observability enabled for OpenAI client")
-    else:
-        from openai import AsyncOpenAI
-
-        logger.debug(
-            "Langfuse environment variables not configured, using standard OpenAI client"
-        )
-except ImportError:
-    from openai import AsyncOpenAI
-
-    logger.debug("Langfuse not available, using standard OpenAI client")
+    for _cls_name in ("Embeddings", "AsyncEmbeddings"):
+        _cls = getattr(_emb_mod, _cls_name, None)
+        if _cls and hasattr(_cls.create, "__wrapped__"):
+            _cls.create = _cls.create.__wrapped__
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance

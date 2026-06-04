@@ -67,6 +67,12 @@ from lightrag.utils import (
     save_to_cache,
     serialize_llm_cache_identity,
 )
+from lightrag.tracing import (
+    lf_observe,
+    lf_start_as_current_observation, 
+    lf_update_current_span, 
+    lf_propagate_attributes
+)
 from lightrag.utils_pipeline import (
     archive_docx_source_after_full_docs_sync,
     archive_source_after_full_docs_sync,
@@ -1953,6 +1959,7 @@ class _PipelineMixin:
     # Single-document state machine
     # ============================================================
 
+    @lf_observe(name="index-document", as_type="span", capture_input=False)
     async def process_single_document(
         self,
         *,
@@ -1982,11 +1989,154 @@ class _PipelineMixin:
         chunk_results: list = []
         doc_process_opts = parse_process_options("")
 
+        def _status_doc_span_input(doc: DocProcessingStatus) -> dict[str, Any]:
+            """Helper to shape the status_doc fields for better observability in the span input"""
+            return {
+                "content_length": doc.content_length,
+                "file_path": doc.file_path,
+                "created_at": doc.created_at,
+                "updated_at": doc.updated_at,
+                "track_id": doc.track_id,
+            }
+
+        lf_update_current_span(
+            input={
+                "doc_id": doc_id,
+                **_status_doc_span_input(status_doc),
+            },
+        )
+
         def get_failed_chunk_snapshot() -> tuple[list[str], int]:
             if chunks:
                 chunk_ids = list(chunks.keys())
                 return chunk_ids, len(chunk_ids)
             return chunk_fields_from_status_doc(status_doc)
+
+        def build_span_entities_relations(
+            raw_chunk_results: list[Any],
+            k: int,
+        ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+            """Build span-friendly extracted entities/relations grouped by source_id.
+
+            Expected shape for each item is ``(maybe_nodes, maybe_edges)`` where
+            nodes are ``dict[str, list[dict]]`` and edges are
+            ``dict[tuple[str, str], list[dict]]``.
+            """
+
+            entities_by_source: dict[str, list[dict[str, Any]]] = {}
+            relations_by_source: dict[str, list[dict[str, Any]]] = {}
+            seen_entities: set[tuple[str, str, Any, Any]] = set()
+            seen_relations: set[tuple[str, str, str, Any, Any]] = set()
+            entities_count = 0
+            relations_count = 0
+
+            cap = max(0, int(k))
+
+            for item in raw_chunk_results:
+                if not (isinstance(item, tuple) and len(item) == 2):
+                    continue
+
+                maybe_nodes, maybe_edges = item
+
+                if isinstance(maybe_nodes, dict):
+                    for entity_name, entity_rows in maybe_nodes.items():
+                        if entities_count >= cap:
+                            break
+                        if not (isinstance(entity_name, str) and entity_name):
+                            continue
+                        if isinstance(entity_rows, list):
+                            for entity_row in entity_rows:
+                                if entities_count >= cap:
+                                    break
+                                if isinstance(entity_row, dict):
+                                    source_id = str(
+                                        entity_row.get("source_id") or "unknown_source"
+                                    )
+                                    entity_type = entity_row.get("entity_type")
+                                    description = entity_row.get("description")
+                                    dedupe_key = (
+                                        source_id,
+                                        entity_name,
+                                        entity_type,
+                                        description,
+                                    )
+                                    if dedupe_key in seen_entities:
+                                        continue
+                                    seen_entities.add(dedupe_key)
+                                    entities_by_source.setdefault(source_id, []).append(
+                                        {
+                                            "entity_name": entity_name,
+                                            "entity_type": entity_type,
+                                            "description": description,
+                                        }
+                                    )
+                                    entities_count += 1
+
+                if isinstance(maybe_edges, dict):
+                    for edge_key, edge_rows in maybe_edges.items():
+                        if relations_count >= cap:
+                            break
+                        if (
+                            not isinstance(edge_key, tuple)
+                            or len(edge_key) != 2
+                            or not all(isinstance(x, str) and x for x in edge_key)
+                        ):
+                            continue
+
+                        if isinstance(edge_rows, list):
+                            for edge_row in edge_rows:
+                                if relations_count >= cap:
+                                    break
+                                if isinstance(edge_row, dict):
+                                    source_id = str(
+                                        edge_row.get("source_id") or "unknown_source"
+                                    )
+                                    src_id = edge_row.get("src_id")
+                                    tgt_id = edge_row.get("tgt_id")
+                                    if not (
+                                        isinstance(src_id, str)
+                                        and src_id
+                                        and isinstance(tgt_id, str)
+                                        and tgt_id
+                                    ):
+                                        src_id, tgt_id = edge_key
+                                    weight = edge_row.get("weight")
+                                    description = edge_row.get("description")
+                                    dedupe_key = (
+                                        source_id,
+                                        src_id,
+                                        tgt_id,
+                                        weight,
+                                        description,
+                                    )
+                                    if dedupe_key in seen_relations:
+                                        continue
+                                    seen_relations.add(dedupe_key)
+                                    relations_by_source.setdefault(source_id, []).append(
+                                        {
+                                            "source_id": src_id,
+                                            "target_id": tgt_id,
+                                            "weight": weight,
+                                            "description": description,
+                                        }
+                                    )
+                                    relations_count += 1
+
+            extracted_entities = sorted(
+                (
+                    {"source_id": source_id, "entities": entities}
+                    for source_id, entities in entities_by_source.items()
+                ),
+                key=lambda item: item["source_id"],
+            )
+            extracted_relations = sorted(
+                (
+                    {"source_id": source_id, "relations": relations}
+                    for source_id, relations in relations_by_source.items()
+                ),
+                key=lambda item: item["source_id"],
+            )
+            return extracted_entities, extracted_relations
 
         async with ctx.semaphore:
             try:
@@ -2441,13 +2591,29 @@ class _PipelineMixin:
                     chunk_results = []
                     extraction_meta["skip_kg"] = True
                 else:
-                    entity_relation_task = asyncio.create_task(
-                        self._process_extract_entities(
-                            chunks,
-                            ctx.pipeline_status,
-                            ctx.pipeline_status_lock,
-                        )
-                    )
+                    async def _extract_entities():
+                        async with lf_start_as_current_observation(
+                            name="entity-relation-extraction",
+                            metadata={
+                                "doc_id": doc_id, 
+                                "file_path": file_path,
+                                "chunk_count": str(len(chunks))
+                                },
+                        ):
+                            async with lf_propagate_attributes(
+                                metadata={
+                                    "doc_id": doc_id, 
+                                    "file_path": file_path,
+                                    "chunk_count": str(len(chunks))
+                                },                               
+                            ):
+                                return await self._process_extract_entities(
+                                    chunks,
+                                    ctx.pipeline_status,
+                                    ctx.pipeline_status_lock,
+                                )
+
+                    entity_relation_task = asyncio.create_task(_extract_entities())
                     chunk_results = await entity_relation_task
                 file_extraction_stage_ok = True
 
@@ -2487,24 +2653,39 @@ class _PipelineMixin:
                     # chunks_vdb / text_chunks writes (already done above)
                     # and reach PROCESSED.
                     if not doc_process_opts.skip_kg:
-                        await merge_nodes_and_edges(
-                            chunk_results=chunk_results,
-                            knowledge_graph_inst=self.chunk_entity_relation_graph,
-                            entity_vdb=self.entities_vdb,
-                            relationships_vdb=self.relationships_vdb,
-                            global_config=self._build_global_config(),
-                            full_entities_storage=self.full_entities,
-                            full_relations_storage=self.full_relations,
-                            doc_id=doc_id,
-                            pipeline_status=ctx.pipeline_status,
-                            pipeline_status_lock=ctx.pipeline_status_lock,
-                            llm_response_cache=self.llm_response_cache,
-                            entity_chunks_storage=self.entity_chunks,
-                            relation_chunks_storage=self.relation_chunks,
-                            current_file_number=current_file_number,
-                            total_files=ctx.total_files,
-                            file_path=file_path,
-                        )
+                        async with lf_start_as_current_observation(
+                            name="merge-nodes-and-edges",
+                            metadata={
+                                "doc_id": doc_id, 
+                                "file_path": file_path,
+                                "chunk_count": str(len(chunks))
+                                },
+                        ):
+                            async with lf_propagate_attributes(
+                                metadata={
+                                    "doc_id": doc_id, 
+                                    "file_path": file_path,
+                                    "chunk_count": str(len(chunks))
+                                },
+                            ):
+                                await merge_nodes_and_edges(
+                                    chunk_results=chunk_results,
+                                    knowledge_graph_inst=self.chunk_entity_relation_graph,
+                                    entity_vdb=self.entities_vdb,
+                                    relationships_vdb=self.relationships_vdb,
+                                    global_config=self._build_global_config(),
+                                    full_entities_storage=self.full_entities,
+                                    full_relations_storage=self.full_relations,
+                                    doc_id=doc_id,
+                                    pipeline_status=ctx.pipeline_status,
+                                    pipeline_status_lock=ctx.pipeline_status_lock,
+                                    llm_response_cache=self.llm_response_cache,
+                                    entity_chunks_storage=self.entity_chunks,
+                                    relation_chunks_storage=self.relation_chunks,
+                                    current_file_number=current_file_number,
+                                    total_files=ctx.total_files,
+                                    file_path=file_path,
+                                )
 
                     # If another in-flight document already triggered an abort
                     # (e.g. a storage flush error set cancellation_requested),
@@ -2534,6 +2715,22 @@ class _PipelineMixin:
                     )
 
                     await self._insert_done()
+
+
+                    extracted_entities, extracted_relations = (
+                        build_span_entities_relations(chunk_results, k=10)
+                    )
+
+                    lf_update_current_span(
+                        output={
+                            "status": "processed",
+                            "chunks_count": str(len(chunks)),
+                            "chunk_results_count": str(len(chunk_results)),
+                            "skip_kg": bool(doc_process_opts.skip_kg),
+                            "extracted_entities": extracted_entities,
+                            "extracted_relations": extracted_relations,
+                        }
+                    )
 
                     async with ctx.pipeline_status_lock:
                         log_message = (

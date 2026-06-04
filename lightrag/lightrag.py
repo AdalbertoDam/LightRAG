@@ -132,6 +132,12 @@ from lightrag.utils import (
     normalize_source_ids_limit_method,
     normalize_string_list,
 )
+from lightrag.tracing import (
+    lf_observe,
+    lf_get_current_trace_context,
+    lf_flush,
+    is_tracing_enabled,
+)
 from lightrag.types import KnowledgeGraph
 from dotenv import load_dotenv
 from lightrag.pipeline import _PipelineMixin
@@ -2257,12 +2263,20 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 )
 
                 param.stream = True if param.stream is None else param.stream
+                kwargs = {}       
+                if is_tracing_enabled():
+                    langfuse_config = {
+                        "name": "llm-query",
+                        **lf_get_current_trace_context(),
+                    }
+                kwargs.update(**langfuse_config)
                 response = await use_llm_func(
                     query.strip(),
                     system_prompt=system_prompt,
                     history_messages=param.conversation_history,
                     enable_cot=True,
                     stream=param.stream,
+                    **kwargs,
                 )
                 if type(response) is str:
                     return {

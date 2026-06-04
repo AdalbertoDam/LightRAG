@@ -75,6 +75,11 @@ from lightrag.constants import (
     DEFAULT_ENTITY_NAME_MAX_BYTES,
 )
 from lightrag.kg.shared_storage import get_storage_keyed_lock
+from lightrag.tracing import (
+    lf_update_current_span, 
+    lf_get_current_trace_context,
+    is_tracing_enabled,
+)
 import time
 from dotenv import load_dotenv
 
@@ -411,6 +416,12 @@ async def _summarize_descriptions(
         llm_response_cache=llm_response_cache,
         cache_type="summary",
         llm_cache_identity=get_llm_cache_identity(global_config, "extract"),
+        span_name="summarize-entity-relation-descriptions",
+        span_metadata={
+            "description_type": description_type,
+            "description_name": description_name[:200],
+            "description_count": str(len(description_list)),
+        },
     )
 
     # Check summary token length against embedding limit
@@ -3239,6 +3250,17 @@ async def merge_nodes_and_edges(
         pipeline_status["latest_message"] = log_message
         pipeline_status["history_messages"].append(log_message)
 
+    lf_update_current_span(
+        input={
+            "total_entities": total_entities_count,
+            "total_relations": total_relations_count,
+        },
+        output={
+            "entities_merged": len(processed_entities),
+            "extra_entities_from_relations": len(all_added_entities),
+            "relations_merged": len(processed_edges),
+        },
+    )
 
 async def extract_entities(
     chunks: dict[str, TextChunkSchema],
@@ -3373,16 +3395,20 @@ async def extract_entities(
             ].format(**{**context_base, "input_text": content})
 
         final_result, timestamp = await use_llm_func_with_cache(
-            entity_extraction_user_prompt,
-            use_llm_func,
-            system_prompt=entity_extraction_system_prompt,
-            llm_response_cache=llm_response_cache,
-            cache_type="extract",
-            chunk_id=chunk_key,
-            cache_keys_collector=cache_keys_collector,
-            response_format=({"type": "json_object"} if use_json_extraction else None),
-            llm_cache_identity=get_llm_cache_identity(global_config, "extract"),
-        )
+                entity_extraction_user_prompt,
+                use_llm_func,
+                system_prompt=entity_extraction_system_prompt,
+                llm_response_cache=llm_response_cache,
+                cache_type="extract",
+                chunk_id=chunk_key,
+                cache_keys_collector=cache_keys_collector,
+                response_format=({"type": "json_object"} if use_json_extraction else None),
+                llm_cache_identity=get_llm_cache_identity(global_config, "extract"),
+                span_name="entity-relation-extraction-llm",
+                span_metadata={
+                    "chunk_id": chunk_key,
+                },
+            )
 
         history = pack_user_ass_to_openai_messages(
             entity_extraction_user_prompt, final_result
@@ -3438,19 +3464,23 @@ async def extract_entities(
 
         if run_gleaning:
             glean_result, timestamp = await use_llm_func_with_cache(
-                entity_continue_extraction_user_prompt,
-                use_llm_func,
-                system_prompt=entity_extraction_system_prompt,
-                llm_response_cache=llm_response_cache,
-                history_messages=history,
-                cache_type="extract",
-                chunk_id=chunk_key,
-                cache_keys_collector=cache_keys_collector,
-                response_format=(
-                    {"type": "json_object"} if use_json_extraction else None
-                ),
-                llm_cache_identity=get_llm_cache_identity(global_config, "extract"),
-            )
+                    entity_continue_extraction_user_prompt,
+                    use_llm_func,
+                    system_prompt=entity_extraction_system_prompt,
+                    llm_response_cache=llm_response_cache,
+                    history_messages=history,
+                    cache_type="extract",
+                    chunk_id=chunk_key,
+                    cache_keys_collector=cache_keys_collector,
+                    response_format=(
+                        {"type": "json_object"} if use_json_extraction else None
+                    ),
+                    llm_cache_identity=get_llm_cache_identity(global_config, "extract"),
+                    span_name="entity-relation-extraction-gleaning-llm",
+                    span_metadata={
+                        "chunk_id": chunk_key,
+                    },
+                )
 
             # Process gleaning result with appropriate parser
             if use_json_extraction:
@@ -3664,6 +3694,13 @@ async def extract_entities(
 
     # If all tasks completed successfully, chunk_results already contains the results
     # Return the chunk_results for later processing in merge_nodes_and_edges
+    lf_update_current_span(
+        output={
+            "chunks_processed": len(chunk_results),
+            "unique_entities": sum(len(nodes) for nodes, _ in chunk_results),
+            "unique_relations": sum(len(edges) for _, edges in chunk_results),
+        },
+    )
     return chunk_results
 
 
@@ -3819,13 +3856,25 @@ async def kg_query(
             " == LLM cache == Query cache hit, using cached response as query result"
         )
         response = cached_response
+        lf_update_current_span(
+            metadata={"query_cache_hit": True},
+            output=cached_response[:2000],
+        )
     else:
+        kwargs = {}
+        if is_tracing_enabled():
+            langfuse_config = {
+                "name": "llm-query-response",
+                **lf_get_current_trace_context(),
+            }
+            kwargs.update(**langfuse_config)
         response = await use_model_func(
             user_query,
             system_prompt=sys_prompt,
             history_messages=query_param.conversation_history,
             enable_cot=True,
             stream=query_param.stream,
+            **kwargs,
         )
 
         if hashing_kv and hashing_kv.global_config.get("enable_llm_cache"):
@@ -4071,6 +4120,13 @@ async def extract_keywords_only(
             cached_response
         )
         if is_valid_payload:
+            lf_update_current_span(
+                metadata={
+                    "keywords_cache_hit": True,
+                    "keywords_cache_hl_count": str(len(hl_keywords)),
+                    "keywords_cache_ll_count": str(len(ll_keywords)),
+                },
+            )
             return hl_keywords, ll_keywords
         else:
             logger.warning(
@@ -4094,9 +4150,15 @@ async def extract_keywords_only(
     # Apply higher priority (5) to query relation LLM function
     use_model_func = partial(
         global_config["role_llm_funcs"]["keyword"], _priority=DEFAULT_QUERY_PRIORITY
-    )
-
-    result = await use_model_func(kw_prompt, response_format={"type": "json_object"})
+    )    
+    kwargs = {}
+    if is_tracing_enabled():
+        langfuse_config = {
+            "name": "llm-query-keywords-extraction",
+            **lf_get_current_trace_context(),
+        }
+        kwargs.update(**langfuse_config)
+    result = await use_model_func(kw_prompt, response_format={"type": "json_object"}, **kwargs)
 
     # 5. Parse out JSON from the LLM response with tolerant provider normalization
     _, hl_keywords, ll_keywords = _parse_keywords_payload(result)
@@ -5765,13 +5827,25 @@ async def naive_query(
             " == LLM cache == Query cache hit, using cached response as query result"
         )
         response = cached_response
+        lf_update_current_span(
+            metadata={"query_cache_hit": True},
+            output=cached_response[:2000],
+        )
     else:
+        kwargs = {}
+        if is_tracing_enabled():
+            langfuse_config = {
+                "name": "llm-query-response",
+                **lf_get_current_trace_context(),
+            }
+            kwargs.update(**langfuse_config)
         response = await use_model_func(
             user_query,
             system_prompt=sys_prompt,
             history_messages=query_param.conversation_history,
             enable_cot=True,
             stream=query_param.stream,
+            **kwargs,
         )
 
         if hashing_kv and hashing_kv.global_config.get("enable_llm_cache"):

@@ -47,6 +47,13 @@ from lightrag.constants import (
     SOURCE_IDS_LIMIT_METHOD_FIFO,
     PARSED_DIR_NAME,
 )
+from lightrag.tracing import (
+    _get_max_output_chars,
+    lf_update_current_span,
+    lf_start_as_current_observation,
+    lf_get_current_trace_context,
+    is_tracing_enabled,
+)
 
 # Precompile regex pattern for JSON sanitization (module-level, compiled once)
 _SURROGATE_PATTERN = re.compile(r"[\uD800-\uDFFF\uFFFE\uFFFF]")
@@ -601,8 +608,26 @@ class EmbeddingFunc:
             if "max_token_size" in sig.parameters:
                 kwargs["max_token_size"] = self.max_token_size
 
-        # Call the actual embedding function
-        result = await self.func(*args, **kwargs)
+        # Create a lightweight Langfuse span for the embedding call BEFORE it
+        # enters the priority-queue worker. This runs in the caller's async
+        # context where the OTel trace/span is still correct.  The actual
+        # OpenAI embedding call inside the worker is intentionally NOT
+        # auto-instrumented (see openai_embed) to avoid cross-request leaking.
+        texts = args[0] if args and isinstance(args[0], (list, tuple)) else []
+        text_count = len(texts)
+        text_snippets = [text[:50] for text in texts]
+        embedding_context = kwargs.get("context", "document")
+        async with lf_start_as_current_observation(
+            name="embedding",
+            as_type="embedding",
+            input={"text_count": text_count, "text_snippets": text_snippets, "context": embedding_context},
+            metadata={
+                "model": self.model_name or "unknown",
+                "embedding_dim": self.embedding_dim,
+            },
+        ):
+            # Call the actual embedding function
+            result = await self.func(*args, **kwargs)
 
         # Validate embedding dimensions using total element count
         total_elements = result.size  # Total number of elements in the numpy array
@@ -2619,6 +2644,8 @@ async def use_llm_func_with_cache(
     response_format: Any | None = None,
     entity_extraction: bool = False,
     llm_cache_identity: Any | None = None,
+    span_name: str = "llm-call",
+    span_metadata: dict | None = None,
 ) -> tuple[str, int]:
     """Call LLM function with cache support and text sanitization
 
@@ -2716,6 +2743,12 @@ async def use_llm_func_with_cache(
             content, timestamp = cached_result
             logger.debug(f"Found cache for {arg_hash}")
             statistic_data["llm_cache"] += 1
+            # Cache hits are recorded as a plain span (not a "generation") so
+            # they do not inflate token counts or cost estimates in Langfuse.
+            lf_update_current_span(
+                metadata={"cache_hit": True, "cache_type": cache_type},
+                output=content[:_get_max_output_chars()],
+            )
 
             # Add cache key to collector if provided
             if cache_keys_collector is not None:
@@ -2724,7 +2757,9 @@ async def use_llm_func_with_cache(
             return content, timestamp
         statistic_data["llm_call"] += 1
 
-        # Call LLM with sanitized input
+        # Call LLM with sanitized input.
+        # langfuse.openai.AsyncOpenAI auto-instruments the underlying API call
+        # and creates the generation span automatically — no manual wrapper needed.
         kwargs = {}
         if safe_history_messages:
             kwargs["history_messages"] = safe_history_messages
@@ -2732,6 +2767,13 @@ async def use_llm_func_with_cache(
             kwargs["max_tokens"] = max_tokens
         if response_format is not None:
             kwargs["response_format"] = response_format
+        if is_tracing_enabled():
+            langfuse_config = {
+                "name": span_name,
+                "metadata": {**(span_metadata or {})},
+                **lf_get_current_trace_context(),
+            }
+            kwargs.update(**langfuse_config)
 
         res: str = await use_llm_func(
             safe_user_prompt, system_prompt=safe_system_prompt, **kwargs
@@ -2769,6 +2811,11 @@ async def use_llm_func_with_cache(
     if response_format is not None:
         kwargs["response_format"] = response_format
 
+    if is_tracing_enabled():
+        kwargs["langfuse_config"] = {
+            "name": span_name,
+            "metadata": {**(span_metadata or {})},
+        }       
     try:
         res = await use_llm_func(
             safe_user_prompt, system_prompt=safe_system_prompt, **kwargs
