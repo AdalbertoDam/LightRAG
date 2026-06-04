@@ -69,9 +69,8 @@ from lightrag.utils import (
 )
 from lightrag.tracing import (
     lf_observe,
-    lf_start_as_current_observation, 
-    lf_update_current_span, 
-    lf_propagate_attributes
+    lf_start_as_current_observation,
+    lf_update_current_span,
 )
 from lightrag.utils_pipeline import (
     archive_docx_source_after_full_docs_sync,
@@ -2600,18 +2599,11 @@ class _PipelineMixin:
                                 "chunk_count": str(len(chunks))
                                 },
                         ):
-                            async with lf_propagate_attributes(
-                                metadata={
-                                    "doc_id": doc_id, 
-                                    "file_path": file_path,
-                                    "chunk_count": str(len(chunks))
-                                },                               
-                            ):
-                                return await self._process_extract_entities(
-                                    chunks,
-                                    ctx.pipeline_status,
-                                    ctx.pipeline_status_lock,
-                                )
+                            return await self._process_extract_entities(
+                                chunks,
+                                ctx.pipeline_status,
+                                ctx.pipeline_status_lock,
+                            )
 
                     entity_relation_task = asyncio.create_task(_extract_entities())
                     chunk_results = await entity_relation_task
@@ -2661,14 +2653,7 @@ class _PipelineMixin:
                                 "chunk_count": str(len(chunks))
                                 },
                         ):
-                            async with lf_propagate_attributes(
-                                metadata={
-                                    "doc_id": doc_id, 
-                                    "file_path": file_path,
-                                    "chunk_count": str(len(chunks))
-                                },
-                            ):
-                                await merge_nodes_and_edges(
+                            await merge_nodes_and_edges(
                                     chunk_results=chunk_results,
                                     knowledge_graph_inst=self.chunk_entity_relation_graph,
                                     entity_vdb=self.entities_vdb,

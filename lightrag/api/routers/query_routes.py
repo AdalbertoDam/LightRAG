@@ -420,6 +420,8 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             # Force stream=False for /query endpoint regardless of include_references setting
             param.stream = False
 
+            lf_update_current_span(input={"query": request.query, "mode": request.mode})
+
             # Unified approach: always use aquery_llm for both cases
             async with lf_propagate_attributes(
                 tags=["query", f"query_mode:{request.mode}", f"streaming:{param.stream}"],
@@ -553,7 +555,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    @lf_observe(name="query-text-stream", capture_input=True, capture_output=False)
+    @lf_observe(name="query-text-stream", capture_input=False, capture_output=False)
     async def query_text_stream(request: QueryRequest):
         """
         Advanced RAG query endpoint with flexible streaming response.
@@ -685,6 +687,8 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             # Use the stream parameter from the request, defaulting to True if not specified
             stream_mode = request.stream if request.stream is not None else True
             param = request.to_query_params(stream_mode)
+
+            lf_update_current_span(input={"query": request.query, "mode": request.mode})
 
             from fastapi.responses import StreamingResponse
 

@@ -3345,7 +3345,7 @@ def create_document_routes(
     @router.post(
         "/text", response_model=InsertResponse, dependencies=[Depends(combined_auth)]
     )
-    @lf_observe(name="insert-text", as_type="span")
+    @lf_observe(name="insert-text", as_type="span", capture_input=False)
     async def insert_text(
         request: InsertTextRequest, background_tasks: BackgroundTasks
     ):
@@ -3380,6 +3380,8 @@ def create_document_routes(
             # Reject text insertion while a scan is in progress AND reserve
             # a pending-enqueue slot — see /upload for the rationale.
             slot_reserved = await _reserve_enqueue_slot(rag)
+
+            lf_update_current_span(input={"file_source": request.file_source})
 
             # Check if file_source already exists in doc_status storage
             if not is_valid_file_source(request.file_source):
@@ -3461,7 +3463,7 @@ def create_document_routes(
         response_model=InsertResponse,
         dependencies=[Depends(combined_auth)],
     )
-    @lf_observe(name="insert-texts", as_type="span")
+    @lf_observe(name="insert-texts", as_type="span", capture_input=False)
     async def insert_texts(
         request: InsertTextsRequest, background_tasks: BackgroundTasks
     ):
@@ -3497,6 +3499,8 @@ def create_document_routes(
             # Reject batch text insertion while a scan is in progress AND
             # reserve a pending-enqueue slot — see /upload for the rationale.
             slot_reserved = await _reserve_enqueue_slot(rag)
+
+            lf_update_current_span(input={"file_sources": request.file_sources, "document_count": len(request.texts)})
 
             # Check if any file_sources already exist in doc_status storage
             if not request.file_sources or len(request.file_sources) != len(
