@@ -10,12 +10,10 @@ from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.tracing import (
     lf_observe,
     lf_propagate_attributes,
-    lf_flush,
     lf_update_current_span,
 )
 from lightrag.utils import logger
 from pydantic import BaseModel, Field, field_validator
-from dataclasses import asdict
 
 
 class QueryRequest(BaseModel):
@@ -427,8 +425,8 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 tags=["query", f"query_mode:{request.mode}", f"streaming:{param.stream}"],
                 trace_name="query/query",
                 metadata={
-                    "query_mode": request.mode, 
-                    "streaming": param.stream,
+                    "query_mode": request.mode,
+                    "streaming": str(param.stream),
                     "workspace": rag.workspace,
                 }
             ):
@@ -1178,7 +1176,12 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             param = request.to_query_params(False)  # No streaming for data endpoint
             lf_update_current_span(
                 input={"query": request.query},
-                metadata=asdict(param),
+                metadata={
+                    "mode": param.mode,
+                    "stream": str(param.stream),
+                    "top_k": str(param.top_k),
+                    "response_type": param.response_type,
+                },
             )
             async with lf_propagate_attributes(
                 tags=["retrieval", f"retrieval_mode:{request.mode}"],

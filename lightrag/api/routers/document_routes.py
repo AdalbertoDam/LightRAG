@@ -3559,7 +3559,7 @@ def create_document_routes(
                 async with lf_propagate_attributes(
                     tags=["insert-texts", "indexing"],
                     metadata={
-                        "document_count": len(request.texts),
+                        "document_count": str(len(request.texts)),
                         "file_sources": normalized_file_sources,
                         "text_snippets": [text[:10] for text in request.texts],
                         "workspace": rag.workspace,
