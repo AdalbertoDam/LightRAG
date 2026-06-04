@@ -2269,7 +2269,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                         "name": "llm-query",
                         **lf_get_current_trace_context(),
                     }
-                kwargs.update(**langfuse_config)
+                    kwargs.update(**langfuse_config)
                 response = await use_llm_func(
                     query.strip(),
                     system_prompt=system_prompt,
