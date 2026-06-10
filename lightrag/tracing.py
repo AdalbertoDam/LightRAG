@@ -243,6 +243,29 @@ def lf_get_current_trace_context() -> dict[str, str]:
         return {}
 
 
+def lf_score_current_span(scores: list[dict[str, Any]]) -> None:
+    """Attach scores to the currently active Langfuse span.
+
+    Each entry in *scores* is a dict with keys that map directly to
+    ``client.score_current_span()``:
+
+        - ``name``      (str, required)
+        - ``value``     (float | bool | str, required)
+        - ``data_type`` (str, optional — inferred if omitted)
+        - ``comment``   (str, optional)
+
+    Silent no-op when tracing is disabled or no span is active.
+    """
+    client = lf_get_client()
+    if client is None:
+        return
+    for score in scores:
+        try:
+            client.score_current_span(**score)
+        except Exception as exc:
+            logger.debug("Failed to score Langfuse span (%s): %s", score.get("name"), exc)
+
+
 def lf_flush() -> None:
     """Flush pending Langfuse events."""
     if not is_tracing_enabled():

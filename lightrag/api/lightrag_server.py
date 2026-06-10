@@ -72,6 +72,7 @@ from lightrag.kg.shared_storage import (
 )
 from fastapi.security import OAuth2PasswordRequestForm
 from lightrag.api.auth import auth_handler
+from src.evaluation.config.setup_langfuse_evaluators import setup_evaluators
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
@@ -1281,8 +1282,9 @@ def create_app(args):
 
             ASCIIColors.green("\nServer is ready to accept connections! 🚀\n")
 
-            # Check Tracing status 
-            is_tracing_enabled()
+            # Check Tracing status and provision LLM-as-a-Judge evaluators if enabled
+            if is_tracing_enabled():
+                await setup_evaluators()
             yield
 
         finally:

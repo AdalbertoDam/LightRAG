@@ -10,11 +10,14 @@ from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.tracing import (
     lf_observe,
     lf_propagate_attributes,
+    lf_score_current_span,
     lf_update_current_span,
 )
 from lightrag.utils import logger
 from pydantic import BaseModel, Field, field_validator
 
+from lightrag.scores import _submit_retrieval_scores  
+from dataclasses import asdict
 
 class QueryRequest(BaseModel):
     query: str = Field(
@@ -1186,22 +1189,18 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             param = request.to_query_params(False)  # No streaming for data endpoint
             lf_update_current_span(
                 input={"query": request.query},
-                metadata={
-                    "mode": param.mode,
-                    "stream": str(param.stream),
-                    "top_k": str(param.top_k),
-                    "response_type": param.response_type,
-                },
+                metadata={"query_request_parameters": asdict(param)},
             )
             async with lf_propagate_attributes(
                 tags=["retrieval", f"retrieval_mode:{request.mode}"],
-                metadata={"query_mode": request.mode, "workspace": rag.workspace},
+                metadata={"workspace": rag.workspace},
                 trace_name="query/data",
             ):
                 response = await rag.aquery_data(request.query, param=param)
 
             # aquery_data returns the new format with status, message, data, and metadata
             if isinstance(response, dict):
+                _submit_retrieval_scores(response)
                 return QueryDataResponse(**response)
             else:
                 # Handle unexpected response format
