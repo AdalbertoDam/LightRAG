@@ -1200,6 +1200,17 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
             # aquery_data returns the new format with status, message, data, and metadata
             if isinstance(response, dict):
+                
+                if processing_info := response.get("metadata", {}).get("processing_info"):
+
+                    lf_update_current_span(
+                        metadata={
+                            "run_entities_eval": 1 if processing_info.get("entities_after_truncation", 0) != 0 else 0,
+                            "run_relations_eval": 1 if processing_info.get("relations_after_truncation", 0) != 0 else 0,
+                            "run_chunks_eval": 1 if processing_info.get("final_chunks_count", 0) != 0 else 0,
+                        }
+                    )
+
                 _submit_retrieval_scores(response)
                 return QueryDataResponse(**response)
             else:
