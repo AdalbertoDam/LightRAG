@@ -241,6 +241,11 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     )
     """Method for selecting text chunks: 'WEIGHT' for weight-based selection, 'VECTOR' for embedding similarity-based selection."""
 
+    enable_content_headings: bool = field(
+        default_factory=lambda: get_env_value("ENABLE_CONTENT_HEADINGS", True, bool)
+    )
+    """Append each chunk's parent heading path as a `content_headings` field in the chunk JSON sent to the LLM."""
+
     # Entity extraction
     # ---
 
@@ -444,7 +449,9 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     """Recommended length of LLM summary output."""
 
     llm_model_max_async: int = field(
-        default=int(os.getenv("MAX_ASYNC", DEFAULT_MAX_ASYNC))
+        default=int(
+            os.getenv("MAX_ASYNC_LLM", os.getenv("MAX_ASYNC", DEFAULT_MAX_ASYNC))
+        )
     )
     """Maximum number of concurrent LLM calls."""
 
@@ -474,12 +481,13 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         default=int(
             os.getenv(
                 "MAX_ASYNC_RERANK",
-                os.getenv("MAX_ASYNC", DEFAULT_MAX_ASYNC),
+                os.getenv("MAX_ASYNC_LLM", os.getenv("MAX_ASYNC", DEFAULT_MAX_ASYNC)),
             )
         )
     )
     """Maximum number of concurrent rerank calls.
-    Falls back to MAX_ASYNC when MAX_ASYNC_RERANK is unset."""
+    Falls back to MAX_ASYNC_LLM when MAX_ASYNC_RERANK is unset
+    (MAX_ASYNC is still accepted as a deprecated alias)."""
 
     default_rerank_timeout: int = field(
         default=int(os.getenv("RERANK_TIMEOUT", DEFAULT_RERANK_TIMEOUT))
@@ -2157,6 +2165,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 global_config,
                 hashing_kv=self.llm_response_cache,
                 system_prompt=None,
+                text_chunks_db=self.text_chunks,
             )
         elif data_param.mode == "bypass":
             logger.debug("[aquery_data] Using bypass mode")
@@ -2253,6 +2262,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                     global_config,
                     hashing_kv=self.llm_response_cache,
                     system_prompt=system_prompt,
+                    text_chunks_db=self.text_chunks,
                 )
             elif param.mode == "bypass":
                 # Bypass mode: directly use LLM without knowledge retrieval

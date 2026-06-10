@@ -36,6 +36,15 @@ DEFAULT_SUMMARY_LENGTH_RECOMMENDED = 600
 DEFAULT_SUMMARY_CONTEXT_SIZE = 12000
 # Maximum token size allowed for entity extraction input context
 DEFAULT_MAX_EXTRACT_INPUT_TOKENS = 20480
+# Maximum token size for the per-chunk `---Section Context---` heading
+# breadcrumb injected into the extraction prompt. Keeps section metadata from
+# pushing an otherwise-valid chunk past the provider context window; over budget
+# the breadcrumb collapses to ``first → … → leaf`` (top-level + nearest section).
+DEFAULT_MAX_SECTION_CONTEXT_TOKENS = 256
+# Per-level character cap for each heading in that breadcrumb. Must stay below
+# 1/3 of DEFAULT_MAX_SECTION_CONTEXT_TOKENS so the collapsed two-level form
+# (first + leaf, plus separator/ellipsis) always fits within the token budget.
+DEFAULT_HEADING_LEVEL_MAX_CHARS = 80
 # Separator for: description, source_id and relation-key fields(Can not be changed after data inserted)
 GRAPH_FIELD_SEP = "<SEP>"
 
@@ -54,20 +63,20 @@ DEFAULT_MIN_RERANK_SCORE = 0.0
 DEFAULT_RERANK_BINDING = "null"
 
 # Default source ids limit in meta data for entity and relation
-DEFAULT_MAX_SOURCE_IDS_PER_ENTITY = 300
-DEFAULT_MAX_SOURCE_IDS_PER_RELATION = 300
+DEFAULT_MAX_SOURCE_IDS_PER_ENTITY = 200
+DEFAULT_MAX_SOURCE_IDS_PER_RELATION = 200
 ### control chunk_ids limitation method: FIFO, FIFO
 ###    FIFO: First in first out
 ###    KEEP: Keep oldest (less merge action and faster)
 SOURCE_IDS_LIMIT_METHOD_KEEP = "KEEP"
 SOURCE_IDS_LIMIT_METHOD_FIFO = "FIFO"
-DEFAULT_SOURCE_IDS_LIMIT_METHOD = SOURCE_IDS_LIMIT_METHOD_FIFO
+DEFAULT_SOURCE_IDS_LIMIT_METHOD = SOURCE_IDS_LIMIT_METHOD_KEEP
 VALID_SOURCE_IDS_LIMIT_METHODS = {
     SOURCE_IDS_LIMIT_METHOD_KEEP,
     SOURCE_IDS_LIMIT_METHOD_FIFO,
 }
 # Maximum number of file paths stored in entity/relation file_path field (For displayed only, does not affect query performance)
-DEFAULT_MAX_FILE_PATHS = 100
+DEFAULT_MAX_FILE_PATHS = 75
 
 # Field length of file_path in Milvus Schema for entity and relation (Should not be changed)
 # file_path must store all file paths up to the DEFAULT_MAX_FILE_PATHS limit within the metadata.
@@ -326,7 +335,7 @@ DEFAULT_MM_CHUNK_DESCRIPTION_MIN_TOKENS = 100
 # Minimum image side (width or height) in pixels accepted for VLM analysis.
 # Anything smaller is treated as decorative (icons, separators, etc.) and
 # written as status="skipped".
-DEFAULT_MM_IMAGE_MIN_PIXEL = 32
+DEFAULT_MM_IMAGE_MIN_PIXEL = 64
 
 # Embedding configuration defaults
 DEFAULT_EMBEDDING_FUNC_MAX_ASYNC = 8  # Default max async for embedding functions
@@ -340,7 +349,7 @@ DEFAULT_LLM_TIMEOUT = 180
 DEFAULT_EMBEDDING_TIMEOUT = 30
 
 # Rerank async / timeout defaults
-# Concurrency falls back to base MAX_ASYNC when env unset; timeout has its own
+# Concurrency falls back to base MAX_ASYNC_LLM when env unset; timeout has its own
 # default since reranker calls are typically much faster than full LLM generation.
 DEFAULT_RERANK_MAX_ASYNC = DEFAULT_MAX_ASYNC
 DEFAULT_RERANK_TIMEOUT = 30
