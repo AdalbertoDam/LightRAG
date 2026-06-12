@@ -430,7 +430,10 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 }
             ):
                 result = await rag.aquery_llm(request.query, param=param)
-
+                lf_update_current_span(
+                    input={"query": request.query, "mode": request.mode},
+                    output={k: v for k, v in result.items() if k != "llm_response"}
+                )
             # Extract LLM response and references from unified result
             llm_response = result.get("llm_response", {})
             data = result.get("data", {})
@@ -749,7 +752,6 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             stream_mode = request.stream if request.stream is not None else True
             param = request.to_query_params(stream_mode)
 
-            lf_update_current_span(input={"query": request.query, "mode": request.mode})
 
             from fastapi.responses import StreamingResponse
 

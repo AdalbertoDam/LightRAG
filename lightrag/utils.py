@@ -621,7 +621,7 @@ class EmbeddingFunc:
         # auto-instrumented (see openai_embed) to avoid cross-request leaking.
         texts = args[0] if args and isinstance(args[0], (list, tuple)) else []
         text_count = len(texts)
-        text_snippets = [text[:50] for text in texts]
+        text_snippets = [text[:50] + "..." for text in texts]
         embedding_context = kwargs.get("context", "document")
         async with lf_start_as_current_observation(
             name="embedding",
