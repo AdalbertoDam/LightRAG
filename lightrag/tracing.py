@@ -62,6 +62,7 @@ def _compute_tracing_enabled() -> bool:
             "Set LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY environment variables to enable tracing."
         )
         return False
+    logger.info("Langfuse tracing enabled")
     return True
 
 
