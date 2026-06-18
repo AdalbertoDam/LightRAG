@@ -421,7 +421,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
             # Unified approach: always use aquery_llm for both cases
             async with lf_propagate_attributes(
-                tags=["query", f"query_mode:{request.mode}", f"streaming:{param.stream}"],
+                tags=["query", f"workspace:{rag.workspace}", f"query_mode:{request.mode}", f"streaming:{param.stream}"],
                 trace_name="query/query",
                 metadata={
                     "query_mode": request.mode,
@@ -757,7 +757,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
             # Unified approach: always use aquery_llm for all cases
             async with lf_propagate_attributes(
-                tags=["query", f"query_mode:{request.mode}", f"streaming:{param.stream}"],
+                tags=["query", f"workspace:{rag.workspace}", f"query_mode:{request.mode}", f"streaming:{param.stream}"],
                 trace_name="query/stream",
                 metadata={
                     "query_mode": request.mode,
@@ -1194,7 +1194,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 metadata={"query_request_parameters": asdict(param)},
             )
             async with lf_propagate_attributes(
-                tags=["retrieval", f"retrieval_mode:{request.mode}"],
+                tags=["retrieval", f"workspace:{rag.workspace}", f"retrieval_mode:{request.mode}"],
                 metadata={"workspace": rag.workspace},
                 trace_name="query/data",
             ):

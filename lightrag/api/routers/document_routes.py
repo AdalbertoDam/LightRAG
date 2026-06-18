@@ -2809,11 +2809,9 @@ def create_document_routes(
                     async with lf_propagate_attributes(
                         tags=["upload", "indexing"],
                         metadata={
-                            "document_count": "1",
-                            "file_name": safe_filename,
                             "workspace": rag.workspace,
                         },
-                        trace_name=f"documents/upload:{safe_filename}"
+                        trace_name=f"documents/upload"
                     ):
                         try:
                             await pipeline_index_file(rag, file_path, track_id)
