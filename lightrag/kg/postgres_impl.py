@@ -42,6 +42,7 @@ from ..utils import (
     compute_mdhash_id,
     _cooperative_yield,
     performance_timing_log,
+    validate_workspace,
 )
 from ..kg.shared_storage import get_data_init_lock, get_namespace_lock
 
@@ -1432,14 +1433,17 @@ class PostgreSQLDB:
         # content_hash uses TEXT (not VARCHAR(N)) so the column stays
         # algorithm-agnostic; future SHA-512 / base64 hashes do not require a
         # schema change. process_options is an opaque selector string emitted
-        # by sanitize_process_options() (e.g. "Fi").
+        # by sanitize_process_options() (e.g. "Fi"). parse_engine is TEXT (not
+        # VARCHAR(32)) because it may carry an encoded engine-parameter
+        # directive, e.g. "mineru(page_range=1-3,language=en)", which exceeds 32
+        # chars; existing VARCHAR(32) columns are widened below.
         columns_to_add = [
             ("sidecar_location", "TEXT NULL"),
             ("parse_format", "VARCHAR(32) NULL DEFAULT 'raw'"),
             ("content_hash", "TEXT NULL"),
             ("process_options", "TEXT NULL"),
             ("chunk_options", "JSONB NULL DEFAULT '{}'::jsonb"),
-            ("parse_engine", "VARCHAR(32) NULL"),
+            ("parse_engine", "TEXT NULL"),
         ]
         try:
             existing = await self.query(
@@ -1476,6 +1480,30 @@ class PostgreSQLDB:
                 logger.error(
                     f"Failed to add column {col_name} to LIGHTRAG_DOC_FULL: {e}"
                 )
+
+        # Widen a pre-existing parse_engine column from the original
+        # VARCHAR(32) to TEXT so an encoded engine-parameter directive (e.g.
+        # "mineru(page_range=1-3,language=en)") is not truncated / rejected as
+        # too long. Idempotent: skipped when already TEXT.
+        try:
+            col = await self.query(
+                """
+                SELECT data_type
+                FROM information_schema.columns
+                WHERE table_name = 'lightrag_doc_full'
+                  AND column_name = 'parse_engine'
+                """,
+            )
+            cur_type = col.get("data_type") if col else None
+            if cur_type and cur_type != "text":
+                logger.info(
+                    f"Widening LIGHTRAG_DOC_FULL.parse_engine to TEXT (was {cur_type})"
+                )
+                await self.execute(
+                    "ALTER TABLE LIGHTRAG_DOC_FULL ALTER COLUMN parse_engine TYPE TEXT"
+                )
+        except Exception as e:
+            logger.error(f"Failed to widen LIGHTRAG_DOC_FULL.parse_engine to TEXT: {e}")
 
     async def _migrate_doc_status_add_content_hash(self):
         """Add content_hash column to LIGHTRAG_DOC_STATUS table if it doesn't exist."""
@@ -2508,6 +2536,7 @@ class PGKVStorage(BaseKVStorage):
     db: PostgreSQLDB = field(default=None)
 
     def __post_init__(self):
+        validate_workspace(self.workspace)
         self._max_batch_size = 200  # DB batch size, independent of embedding batch size
         (
             self._max_upsert_payload_bytes,
@@ -3157,6 +3186,8 @@ class PGKVStorage(BaseKVStorage):
         """
         if not ids:
             return
+        if isinstance(ids, set):
+            ids = list(ids)
 
         table_name = namespace_to_table_name(self.namespace)
         if not table_name:
@@ -3239,6 +3270,7 @@ class PGVectorStorage(BaseVectorStorage):
     db: PostgreSQLDB | None = field(default=None)
 
     def __post_init__(self):
+        validate_workspace(self.workspace)
         self._validate_embedding_func()
         self._max_batch_size = self.global_config["embedding_batch_num"]
         # DB-write batching limits (distinct from the embedding batch size above).
@@ -4438,18 +4470,18 @@ class PGVectorStorage(BaseVectorStorage):
     async def get_by_id(self, id: str) -> dict[str, Any] | None:
         """Get vector data by its ID with read-your-writes against the buffer.
 
-        ``__vector__`` and ``__id__`` are stripped from buffered results to
-        match the other vector backends; callers needing embeddings must use
-        ``get_vectors_by_ids``.
+        The embedding column is stripped from BOTH the buffered and the
+        SQL-fallback result (``__vector__``/``__id__`` from the buffer,
+        ``content_vector`` from the row) so the shapes match each other and
+        the other vector backends. The raw ``content_vector`` is a pgvector
+        value that the asyncpg codec returns as a numpy array, which is not
+        JSON-serializable and would break callers that return this dict in an
+        API response (e.g. ``/graph/entity/edit``). Callers needing embeddings
+        must use ``get_vectors_by_ids``.
 
         Response shape:
-            Buffered hits return ``{"id", "content", <payload fields>,
-            "created_at"}`` only — no embedding column. SQL-fallback hits
-            return the full row including ``content_vector`` (and any
-            namespace-specific columns such as ``entity_name`` or
-            ``source_id``). Callers that only read documented payload
-            fields (``content``, ``id``, ``created_at``) are unaffected;
-            consumers iterating over all keys must tolerate both shapes.
+            ``{"id", "content", <payload fields>, "created_at"}`` — no
+            embedding column, from either path.
         """
         async with self._flush_lock:
             if id in self._pending_vector_deletes:
@@ -4472,7 +4504,11 @@ class PGVectorStorage(BaseVectorStorage):
         try:
             result = await self.db.query(query, [self.workspace, id])
             if result:
-                return dict(result)
+                row = dict(result)
+                # Drop the embedding column: it is a numpy array (pgvector
+                # codec) and not JSON-serializable; matches the buffered shape.
+                row.pop("content_vector", None)
+                return row
             return None
         except Exception as e:
             logger.error(
@@ -4528,6 +4564,9 @@ class PGVectorStorage(BaseVectorStorage):
                     if record is None:
                         continue
                     record_dict = dict(record)
+                    # Drop the (numpy / non-JSON-serializable) embedding column
+                    # so the SQL shape matches the buffered shape.
+                    record_dict.pop("content_vector", None)
                     row_id = record_dict.get("id")
                     if row_id is not None:
                         id_map[str(row_id)] = record_dict
@@ -4674,6 +4713,17 @@ class PGVectorStorage(BaseVectorStorage):
         upserts/deletes against rows that are about to disappear are
         meaningless).
 
+        The same workspace-scoped delete is also issued against the kept
+        legacy table (the un-suffixed table that the model-suffix
+        migration leaves behind as a backup), when it still exists. The
+        legacy->suffixed migration only runs while the suffixed table has
+        no rows for the workspace; if a deliberate clear left this
+        workspace's data behind in legacy, the next startup would migrate
+        it back into the freshly-emptied suffixed table (resurrection).
+        Only this workspace's legacy rows are removed, so other
+        workspaces' legacy data and their pending one-time migration stay
+        intact.
+
         Concurrency contract:
             ``_flush_lock`` guards same-process flush / upsert / delete
             races only. Cross-worker buffered writes are NOT covered —
@@ -4704,6 +4754,22 @@ class PGVectorStorage(BaseVectorStorage):
                     table_name=self.table_name
                 )
                 await self.db.execute(drop_sql, {"workspace": self.workspace})
+
+                # Also clear this workspace's rows from the kept legacy table so
+                # the next startup does not re-migrate the just-cleared data
+                # back into the suffixed table. Skip when there is no separate
+                # legacy table (no model suffix) or it no longer exists.
+                if (
+                    self.legacy_table_name
+                    and self.legacy_table_name.lower() != self.table_name.lower()
+                    and await self.db.check_table_exists(self.legacy_table_name)
+                ):
+                    legacy_drop_sql = SQL_TEMPLATES[
+                        "drop_specifiy_table_workspace"
+                    ].format(table_name=self.legacy_table_name)
+                    await self.db.execute(
+                        legacy_drop_sql, {"workspace": self.workspace}
+                    )
             return {"status": "success", "message": "data dropped"}
         except Exception as e:
             logger.error(
@@ -4754,6 +4820,7 @@ class PGDocStatusStorage(DocStatusStorage):
     db: PostgreSQLDB = field(default=None)
 
     def __post_init__(self):
+        validate_workspace(self.workspace)
         (
             self._max_upsert_payload_bytes,
             self._max_upsert_records_per_batch,
@@ -5544,6 +5611,8 @@ class PGDocStatusStorage(DocStatusStorage):
         """
         if not ids:
             return
+        if isinstance(ids, set):
+            ids = list(ids)
 
         table_name = namespace_to_table_name(self.namespace)
         if not table_name:
@@ -5855,6 +5924,7 @@ _GRAPH_ADVISORY_LOCK_SHARED_SQL = (
 @dataclass
 class PGGraphStorage(BaseGraphStorage):
     def __post_init__(self):
+        validate_workspace(self.workspace)
         # Graph name will be dynamically generated in initialize() based on workspace
         self.db: PostgreSQLDB | None = None
         # Chunk-level batching limits for the batch upsert / remove paths. The
@@ -6878,9 +6948,9 @@ class PGGraphStorage(BaseGraphStorage):
         ]
         batches = _chunk_by_budget(
             normalized,
-            lambda pair: len(pair[0].encode("utf-8"))
-            + len(pair[1].encode("utf-8"))
-            + 8,
+            lambda pair: (
+                len(pair[0].encode("utf-8")) + len(pair[1].encode("utf-8")) + 8
+            ),
             self._max_upsert_payload_bytes,
             self._max_delete_records_per_batch,
         )
@@ -7908,7 +7978,7 @@ TABLES = {
                     -- sanitize_process_options() (e.g. "Fi").
                     process_options TEXT NULL,
                     chunk_options JSONB NULL DEFAULT '{}'::jsonb,
-                    parse_engine VARCHAR(32) NULL,
+                    parse_engine TEXT NULL,
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
 	                CONSTRAINT LIGHTRAG_DOC_FULL_PK PRIMARY KEY (workspace, id)

@@ -1187,9 +1187,9 @@ class TestKVStorageBatching:
                 drop_task = asyncio.create_task(s.drop())
                 for _ in range(5):
                     await asyncio.sleep(0)
-                assert (
-                    not drop_delete_started.is_set()
-                ), "indices.delete should be blocked behind the flush lock"
+                assert not drop_delete_started.is_set(), (
+                    "indices.delete should be blocked behind the flush lock"
+                )
                 assert not drop_task.done()
                 flush_can_finish.set()
                 await flush_task
@@ -1289,9 +1289,9 @@ class TestKVStorageBatching:
                 )
                 for _ in range(5):
                     await asyncio.sleep(0)
-                assert (
-                    not concurrent_task.done()
-                ), "concurrent upsert should be blocked by the flush lock"
+                assert not concurrent_task.done(), (
+                    "concurrent upsert should be blocked by the flush lock"
+                )
                 assert "k2" not in s._pending_upserts
 
                 flush_can_finish.set()
@@ -3278,7 +3278,10 @@ class TestGraphStorage:
         assert node.id == "Alice"
         assert "entity_type" in node.properties
         assert "_id" not in node.properties
-        assert "entity_id" not in node.properties
+        # entity_id must be preserved in properties: the WebUI reads
+        # properties['entity_id'] to render the node's "Name" row and the
+        # neighbour/edge-endpoint labels. Stripping it left the panel nameless.
+        assert node.properties["entity_id"] == "Alice"
 
     @pytest.mark.asyncio
     async def test_construct_graph_edge(self, global_config, embed_func):
@@ -4690,9 +4693,9 @@ class TestVectorStorageBatching:
                 # embedding computation and arrive at the lock.
                 for _ in range(5):
                     await asyncio.sleep(0)
-                assert (
-                    not concurrent_task.done()
-                ), "concurrent upsert should be blocked by the flush lock"
+                assert not concurrent_task.done(), (
+                    "concurrent upsert should be blocked by the flush lock"
+                )
                 # v2 must not be visible in the buffer yet.
                 assert "v2" not in s._pending_vector_docs
 
@@ -4741,9 +4744,9 @@ class TestVectorStorageBatching:
                 delete_task = asyncio.create_task(s.delete(["v1"]))
                 for _ in range(5):
                     await asyncio.sleep(0)
-                assert (
-                    not delete_task.done()
-                ), "concurrent delete should be blocked by the flush lock"
+                assert not delete_task.done(), (
+                    "concurrent delete should be blocked by the flush lock"
+                )
 
                 flush_can_finish.set()
                 await flush_task
@@ -4942,9 +4945,9 @@ class TestVectorStorageBatching:
                 rel_task = asyncio.create_task(s.delete_entity_relation("Alice"))
                 for _ in range(5):
                     await asyncio.sleep(0)
-                assert (
-                    not delete_started.is_set()
-                ), "delete_by_query should be blocked behind the flush lock"
+                assert not delete_started.is_set(), (
+                    "delete_by_query should be blocked behind the flush lock"
+                )
                 assert not rel_task.done()
 
                 flush_can_finish.set()
@@ -4984,9 +4987,9 @@ class TestVectorStorageBatching:
                 drop_task = asyncio.create_task(s.drop())
                 for _ in range(5):
                     await asyncio.sleep(0)
-                assert (
-                    not drop_delete_started.is_set()
-                ), "indices.delete should be blocked behind the flush lock"
+                assert not drop_delete_started.is_set(), (
+                    "indices.delete should be blocked behind the flush lock"
+                )
                 assert not drop_task.done()
 
                 flush_can_finish.set()
@@ -5029,9 +5032,9 @@ class TestVectorStorageBatching:
                 drop_task = asyncio.create_task(s.drop())
                 for _ in range(5):
                     await asyncio.sleep(0)
-                assert (
-                    not drop_delete_started.is_set()
-                ), "indices.delete should be blocked during deferred embedding"
+                assert not drop_delete_started.is_set(), (
+                    "indices.delete should be blocked during deferred embedding"
+                )
                 assert not drop_task.done()
 
                 embedding_can_finish.set()

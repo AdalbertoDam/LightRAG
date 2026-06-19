@@ -42,7 +42,7 @@ MINERU_LOCAL_ENDPOINT=http://localhost:8000
 
 > `P`分块策略是LightRAG原生的分块策略，详情请参阅[Paragraph Semantic 分块策略](ParagraphSemanticChunking-zh.md)。VLM的配资请参阅[基于角色的 LLM/VLM 配置指南](RoleSpecificLLMConfiguration-zh.md)
 
-## 二、内容抽取与处理选项配置
+## 二、文件处理方式配置
 
 LightRAG 的文件处理配置由两部分合成：内容抽取引擎决定原始文件如何被解析，处理选项决定解析后是否执行多模态分析、使用哪种分块方式，以及是否构建知识图谱。通常先用环境变量 `LIGHTRAG_PARSER` 按文件后缀设置默认规则，再用文件名中的 `[hint]` 覆盖单个文件。引擎和选项可以写在同一个配置片段里，例如 `docx:native-iet` 或 `report.[native-R!].docx`。
 
@@ -93,7 +93,7 @@ my-proposal.[mineru].docx       # 使用 MinerU 引擎，处理选项全部默�
 ```
 
 - 左侧匹配的是文件后缀，不是完整文件名；应写 `pdf:mineru`，不要写 `*.pdf:mineru`。
-- 规则可以使用英文逗号 `,` 或分号 `;` 分隔。
+- 规则使用分号 `;`（推荐）或英文逗号 `,` 分隔。
 - 规则按从左到右的顺序检查；优先规则放在前面，通配符规则通常放在最后。
 - 引擎后缀 `-选项` 部分作为该规则匹配文件的默认 `process_options`。例如 `LIGHTRAG_PARSER=docx:native-iet` 表示所有 `.docx` 默认采用 `native` 引擎，并开启图像、表格、公式分析。
 
@@ -118,12 +118,60 @@ notes.[-R].md
 
 解析 hint 时，无横线内容必须整体匹配引擎名（`mineru` / `native` / `docling` / `legacy`）；带横线且横线前有内容时，横线前是引擎、横线后是选项；以横线开头时表示仅指定选项。旧式 `[OPTIONS]` 写法不再合法，例如 `[iet]` 应改为 `[-iet]`。
 
-### 2.4 内容抽取引擎
+#### 为分块策略附加参数
+
+分块策略选择符（`F` / `R` / `V` / `P`）——无论在 `LIGHTRAG_PARSER` 规则还是文件名 hint 中——都可以用圆括号附加该策略的分块参数。括号内逗号**只**用于分隔参数；规则切分是括号感知的，因此该逗号绝不会被误判为规则分隔符（`;` 与 `,` 都是合法的规则分隔符，但推荐 `;`）。
+
+```text
+notes.[-R(chunk_ts=800,chunk_ol=80)].md                            # 文件名 hint
+LIGHTRAG_PARSER=pdf:legacy-R(chunk_ts=800,chunk_ol=80);*:legacy-R  # 规则
+```
+
+当前支持的参数（全称 / 短别名）：
+
+| 参数 | 别名 | 适用策略 | 类型 | 含义 |
+| --- | --- | --- | --- | --- |
+| `chunk_token_size` | `chunk_ts` | F / R / V / P | int（≥ 1） | 各策略的块大小 |
+| `chunk_overlap_token_size` | `chunk_ol` | F / R / P | int（≥ 0） | 块间重叠（V 无重叠） |
+| `drop_references` | `drop_rf` | P | bool | 分块前丢弃文末参考文献节，如 `paper.[-P(drop_rf=true)].pdf`；布尔参数可省略取值，`paper.[-P(drop_rf)].pdf` 等价于 `drop_rf=true` |
+
+- `process_options` 仍是纯选择符字符串；每个参数会写入该策略的 `chunk_options`（见 §3），策略其它来自环境变量的参数保持不变。别名在内部统一归一化为全称。
+- 合并优先级：选择符仍遵循“文件名 hint 的非空选项整体覆盖规则选项”；参数按**同一策略**叠加——先规则参数，再文件名 hint 参数（同一键以文件名为准）。
+- 启动期（`LIGHTRAG_PARSER`）与上传期（文件名 hint）均严格校验：未知参数、类型错误、取值越界、把参数加到不支持的策略（如 `V` 上的 `chunk_ol`）都会给出友好报错。
+
+> `drop_references` 检测调参 `CHUNK_P_REFERENCES_TAIL_N`（默认 2）/ `CHUNK_P_REFERENCES_HEADINGS`（竖线分隔，默认 `References\|Bibliography\|参考文献`）仅经环境变量、运行时实时读取。drop_references可以通过环境变量 `CHUNK_P_DROP_REFERENCES` 设置为全局默认值.
+
+#### 为解析引擎附加参数
+
+参数也可以附加到**引擎 token** 上，按文件覆盖外部引擎的行为。它们被编码进持久化的 `parse_engine` 字段，同时作用于引擎请求与其原始包缓存签名（因此改动参数会触发重解析，而非复用旧缓存包）。
+
+```text
+paper.[mineru(page_range=1-3,language=en,local_parse_method=ocr)].pdf   # 文件名 hint
+scan.[docling(force_ocr=true)].pdf
+LIGHTRAG_PARSER=pdf:mineru(language=en);*:legacy-R                       # 规则
+```
+
+当前支持的引擎参数（全称 / 别名）：
+
+| 引擎 | 参数 | 别名 | 类型 | 说明 |
+| --- | --- | --- | --- | --- |
+| `mineru` | `page_range` | `pr` | 列表 | 一个或多个页码范围；**见下方列表说明** |
+| `mineru` | `language` | — | str | OCR / 模型语言（如 `en`、`ch`） |
+| `mineru` | `local_parse_method` | `local_pm` | 枚举 | `auto` / `txt` / `ocr`（local 模式） |
+| `docling` | `force_ocr` | `ocr` | bool | `true` / `false` |
+
+- **`page_range` 可写多个页码段——每段都单独写一个 `page_range=...`。** 括号 `(...)` 内逗号只分隔参数，因此多段页码要写成 `page_range=1-3,page_range=5,page_range=7-9`，不要写成环境变量里的单串形式 `MINERU_PAGE_RANGES="1-3,5,7-9"`。**多段** `page_range` 需要 `MINERU_API_MODE=official`；`local` 模式只接受单页/单段（如 `page_range=1-3`）。
+- **`local_parse_method` 仅限 local 模式。** 它只影响本地 MinerU 请求，因此在 `MINERU_API_MODE=official` 下会被**拒绝**（official API 既不发送它、也不计入缓存键——接受它将静默无效）。
+- 只有 `mineru` 与 `docling` 接受引擎参数；把参数加到 `legacy`/`native` 会友好报错。校验在启动期（`LIGHTRAG_PARSER`）与上传期均执行。
+- 合并优先级：引擎参数按**最终引擎**解析——当文件名 hint 选中了另一个可用引擎时，规则的引擎参数会被丢弃。
+- `parse_engine` 以 hint 语法存储（如 `mineru(page_range=1-3)`），并展示在 `doc_status` metadata 中，便于查看文档当时使用的解析参数。
+
+### 2.4 文件解析引擎
 
 | 引擎 | 说明 | 支持的文件格式（后缀） |
 | --- | --- | --- |
 | `legacy` | 旧版提取方式，在加入流水线前集中提取内容 | `txt` `md` `mdx` `pdf` `docx` `pptx` `xlsx` `rtf` `odt` `tex` `epub` `html` `htm` `csv` `json` `xml` `yaml` `yml` `log` `conf` `ini` `properties` `sql` `bat` `sh` `c` `h` `cpp` `hpp` `py` `java` `js` `ts` `swift` `go` `rb` `php` `css` `scss` `less` |
-| `native` | 内置智能结构化内容抽取器 | `docx` |
+| `native` | 内置智能结构化内容抽取器 | `docx` `md` `textpack` |
 | `mineru` | 外部 MinerU 内容提取引擎 | `pdf` `doc` `docx` `ppt` `pptx` `xls` `xlsx` `png` `jpg` `jpeg` `jp2` `webp` `gif` `bmp` |
 | `docling` | 外部 Docling 内容提取引擎 | `pdf` `docx` `pptx` `xlsx` `md` `html` `xhtml` `png` `jpg` `jpeg` `tiff` `webp` `bmp` |
 
@@ -131,39 +179,75 @@ notes.[-R].md
 
 LightRAG 在本地会缓存 `mineru` 和 `docling` 引擎的解析结果。重复上传相同的文件通常不会重新调用引擎解析文档。如果需要删除解析缓存，必须在文档管理界面删除文件弹窗中点击“同时删除文件”选项。修改 `mineru` 和 `docling` 引擎的端点地址和有效提取参数也会导致缓存失效，下次上传相同文件的时候会重新调用引擎解析文件内容。
 
-#### MinerU 配置方法与本地部署
+#### 使用 Native 文件解析引擎
 
-MinerU 客户端支持两种模式，二选一：
+`native` 是 LightRAG 内置的结构化内容抽取引擎，**纯本地运行**：不依赖 MinerU / Docling 等外部服务，抽取阶段也不调用 VLM，开箱即用无需任何部署。运行依赖仅 `python-docx` + `defusedxml`（必备）；其中 markdown 路径的 SVG 栅格化额外依赖**可选**的 `cairosvg`（缺失时跳过该 SVG 并记 warning，不影响其余内容）。
 
-- `local`：自建 MinerU 服务（推荐用官方 Docker Compose 部署），LightRAG 通过 HTTP 调用本地容器。
-- `official`：直连 MinerU 官方精准 API v4，需要在 [mineru.net](https://mineru.net) 申请 token。
+支持后缀：`docx` / `md` / `textpack`。启用方式：
 
-**使用 Docker Compose 本地部署**
+- `docx`、`md` 默认仍走 `legacy`，需显式选择 native，例如默认规则 `LIGHTRAG_PARSER=docx:native`、`LIGHTRAG_PARSER=md:native`，或文件名 hint `report.[native-iet].docx`、`notes.[native].md`（语法见 [§2.2](#22-默认规则lightrag_parser) / [§2.3](#23-单文件覆盖文件名-hint)）。
+- `textpack` 为 native 独占后缀，无需 hint/规则即自动路由到 native。
 
-从 Github官方仓库   [opendatalab/MinerU](https://github.com/opendatalab/MinerU) 把 Dockerfile 和 compose.yaml 拷贝到本地。这两个文件应该在仓库的 docker 目录可以找到。然后通过以下命令构建 docker 镜像:
+##### docx 抽取能力
 
-```bash
-docker build --tag mineru:latest .
+native 直接解析 OOXML，能识别以下结构并写入对应 sidecar（sidecar 是否生成由文档实际内容决定，见 [§4.2](#42-__parsed__-目录结构)）：
+
+| 元素 | 抽取行为 | 落盘 |
+| --- | --- | --- |
+| 标题层级 | Heading 1–9（`pPr/outlineLvl` 或样式继承链推断），供 `P` 分块策略按标题切分 | `blocks.jsonl` |
+| 段落 | 含超链接文本、列表自动编号；修订追踪只保留最终文本（去掉删除部分） | `blocks.jsonl` |
+| 表格 | 2D 结构，自动展开合并单元格（colspan/rowspan）、提取跨页重复表头 | `tables.json` |
+| 图片 / drawing | 嵌入图片导出到资源目录，正文留占位符 | `drawings.json` + `<base>.blocks.assets/` |
+| 公式 | OMML → LaTeX，区分块级与行内 | `equations.json` |
+
+图片落盘细节：
+
+- 嵌入图片导出到 `blocks.jsonl` 同级的 `<base>.blocks.assets/` 目录，支持 `png` `jpeg` `gif` `bmp` `tiff` `webp` `emf` `wmf`。
+- **SVG 图片**：Word 在保存 SVG 时会同时存矢量 `.svg` 与一张 PNG 位图回退，native docx 落盘的是这张 **PNG 回退**（读取 `<a:blip>` 的 `r:embed`，指向 PNG），不导出 SVG 矢量原图。对下游 VLM 消费而言 PNG 通常已足够，无需再做栅格化。（注意这与下文 md 路径「SVG 经 cairosvg 栅格化」是不同实现：docx 直接取 Word 已生成的 PNG。）
+- **VML / OLE 对象**（旧版 Word 图片、Visio 图、公式编辑器预览等）：通过 `v:imagedata` 导出其渲染预览，常见为 EMF/WMF，落入同一 assets 目录；若关系标记为外部链接（`TargetMode="External"`），只记录 URL 不导出字节。**注意：EMF/WMF（及 Visio 等 OLE 对象的预览）目前只能"提取落盘"，无法进入多模态分析**——下游 VLM 图像分析只接受栅格格式 `png` / `jpg` / `jpeg` / `gif` / `webp`，其余格式（EMF/WMF/SVG 等）会被静默跳过（标记 `skipped`，不报错、不影响整篇文档）。例外是**公式**：它以 LaTeX 文本而非图片存储，走文本（EXTRACT）角色分析而非 VLM，因此能被正常处理。
+
+##### docx 段落溯源（paraId）提示
+
+native docx 会采集 Word 2013+ 写入的 `w14:paraId` 作为段落级溯源锚点。若文档由 LibreOffice / WPS / 旧版 Word 生成，或被手工改过 docx 内部 XML，部分段落会缺少 paraId，此时会在日志输出一次提示：
+
+```text
+[parse_native] <文件名>: N paragraphs lack paraId; Re-saving file in Word 2013+ to regenerate ids.
 ```
 
-镜像构建好之后通过以下命令启动 API 服务（带 `--profile api` 才会启用 HTTP API 容器，默认监听 8000 端口）：
+受影响块的 `positions` 退化为 `[{"type": "paraid", "range": null}]`。这只是提示，**不影响解析成功**；如需精确段落溯源，按提示在 Word 2013+ 中「另存为 .docx」即可重建 id。
 
-```bash
-docker compose -f compose.yaml --profile api up -d
-```
+##### md / textpack 抽取能力
 
-镜像构建细节、GPU 驱动准备、模型权重位置等请参考官方 README：<https://github.com/opendatalab/MinerU>。
+`native` 引擎除 `docx` 外还支持 Markdown：
 
-**LightRAG 侧 env 配置**
+- `md`：按标题（ATX `#`）分块，识别 md 原生竖线表格（含表头）、HTML `<table>`（含 `<thead>`，保留 colspan/rowspan）、段落级公式（以 `$$` 开头并以 `$$` 结束的段落；行内 `$...$` 不识别）、内嵌图片（base64 data URL）。代码围栏（```` ``` ````）内的内容原样保留，不参与识别。与 `docx` 一样，`md` 默认仍走 `legacy`，需用 `LIGHTRAG_PARSER=md:native` 或文件名 `[native]` hint 选择 native。
+- `textpack`：TextBundle 规范的 zip 包（md 正文 + 资源目录，约定为 `assets/`，Bear / Ulysses 等导出格式）。只有 `native` 支持该后缀，因此无需 hint/规则即自动路由到 native。
+  - **包内结构要求**（正文按扩展名定位，不要求固定叫 `text.markdown`，方便用任意 zip 工具自行打包）：
+    - 正文文件名任意，扩展名为 `.md` 或 `.markdown` 即可。
+    - 若包内含 `*.textbundle` 后缀的子目录，则**最多只能有 1 个**（多于 1 个报错），且正文**只从该 `.textbundle` 子目录查找**（忽略根目录的 md）。
+    - 若包内**不含** `*.textbundle` 子目录，则正文**只从压缩包根目录查找**。
+    - 查找目录内 `.md` / `.markdown` 文件**必须恰好 1 个**：0 个或多于 1 个均报错。
+    - 正文所在目录即资源解析的"包根"（`bundle_root`）。
+  - 包内以相对路径（文件引用）内嵌的图片按相对包根目录解析，**允许放在包内任意子目录**（不限于 `assets/`），但禁止目录穿越（`..`、绝对路径、越出包根的引用会被记 warning 跳过）；解析出的字节须通过图片 magic bytes 校验，否则跳过。独立 `.md`（非 textpack）中的相对路径图片不解析（记 warning 跳过）。
+- SVG 图片（base64 / textpack 包内文件 / 在线下载）会先经 cairosvg 栅格化为 PNG 再写入 sidecar；cairosvg 不可用或渲染失败时跳过该图（记 warning）。
+- 外部 URL 图片（`![](http://...)`）**默认下载并内嵌**（`NATIVE_MD_IMAGE_DOWNLOAD_ENABLED` 默认 `true`）；无论下载成功与否都会生成 drawing（成功内嵌资源，失败回退为外链）。下载默认仅允许可全球路由的公网 IP（DNS 解析结果与每一跳重定向目标都校验，且 socket 直连已校验 IP 以防 DNS rebinding，忽略环境 `HTTP(S)_PROXY`），私网 / 环回 / 链路本地 / 保留 / CGNAT（`100.64.0.0/10`）等一律拒绝；如需放行特定内网段，用 `NATIVE_MD_IMAGE_ALLOWED_NON_PUBLIC_CIDRS` 配置 CIDR 白名单。若设为 `false`，外链图片整个丢弃（不生成对应 drawing，故仅含外链图片的文档不会生成 `drawings.json`）。
 
-Local 模式（自建 mineru-api）：
+##### 环境变量
 
-```bash
-MINERU_API_MODE=local
-MINERU_LOCAL_ENDPOINT=http://localhost:8000
-```
+native 的所有 `NATIVE_*` 环境变量与 `.native_raw/` 缓存目录**仅作用于 markdown / textpack 引擎的外链图片下载**；**docx 路径不读取任何 `NATIVE_*` 变量**。最常用的两个：
 
-Official 模式（MinerU 云端 API）：
+- `LIGHTRAG_FORCE_REPARSE_NATIVE`（默认 `false`）：强制丢弃 `.native_raw/` 缓存、重新联网下载外链图片。
+- `NATIVE_MD_IMAGE_DOWNLOAD_ENABLED`（默认 `true`）：外链图片下载总开关，设为 `false` 时丢弃所有外链图片。
+
+其余下载/大小/SSRF 相关变量（`NATIVE_MD_IMAGE_DOWNLOAD_TIMEOUT` / `NATIVE_MD_IMAGE_DOWNLOAD_REQUIRED` / `NATIVE_MD_IMAGE_MAX_BYTES` / `NATIVE_MD_IMAGE_MAX_SVG_PIXELS` / `NATIVE_MD_IMAGE_ALLOWED_NON_PUBLIC_CIDRS`）含义与默认值见仓库根目录 [env.example](https://github.com/HKUDS/LightRAG/blob/main/env.example)。
+
+下载的外链图片缓存到 `<文件>.native_raw/`（与 `.parsed/` 同级，类比 `.mineru_raw`/`.docling_raw`），重新解析同一未改动文件时直接复用、不再联网；源文件内容或上述大小 / SVG 像素 / CIDR 配置变化时缓存自动失效。删除文档（删除弹窗勾选「同时删除文件」）时该缓存目录会与 `.parsed/` 一并清理。
+
+#### 使用 MinerU 文件解析引擎
+
+LightRAG文档处理管线支持使用MinerU作为文件解析器。支持使用两种MinerU访问模式：
+
+- `official`模式：使用MinerU云端的 API v4 服务。需要先到 [MinerU官网](https://mineru.net/) 注册账号并创建API-KEY。然后在LightRAG的 `.env` 文件中添加以下配置：
 
 ```bash
 MINERU_API_MODE=official
@@ -171,9 +255,116 @@ MINERU_API_TOKEN=<your_token>
 # MINERU_OFFICIAL_ENDPOINT=https://mineru.net   # 默认值，通常无需修改
 ```
 
-其余高级开关（`MINERU_MODEL_VERSION`、`MINERU_LANGUAGE`、`MINERU_ENABLE_TABLE` / `MINERU_ENABLE_FORMULA`、`MINERU_PAGE_RANGES`、`MINERU_LOCAL_BACKEND` / `MINERU_LOCAL_PARSE_METHOD`、`MINERU_POLL_INTERVAL_SECONDS` / `MINERU_MAX_POLLS`、`MINERU_ENGINE_VERSION`、`LIGHTRAG_FORCE_REPARSE_MINERU` 等）请参考仓库根目录 `env.example` 模板的 MinerU 小节。需要特别注意 `MINERU_PAGE_RANGES` 在两种模式下语义不同：`official` 支持完整列表（如 `1-3,5,7-9`），`local` 仅支持单页（`3`）或简单范围（`1-10`），不接受逗号列表。
+* `local`模式：使用本地部署的MInerU服务。部署方式见后面的说明。本地MinerU服务启动后在LightRAG的 `.env` 文件中添加以下配置：
 
-#### Docling 配置方法
+```bash
+MINERU_API_MODE=local
+MINERU_LOCAL_ENDPOINT=http://<your_mineru_local_server_ip>:8000
+```
+
+其余MinerU的详细配置请参考仓库根目录环境变量示例文件 [env.example](https://github.com/HKUDS/LightRAG/blob/main/env.example) 中的 MinerU 小节。针对 `official` 和 `local` 两种模式，分别有不同的环境变量配置。需要仔细阅读示例文件中的说明。
+
+#### **本地部署 MinerU 服务**
+
+从 Github官方仓库   [opendatalab/MinerU](https://github.com/opendatalab/MinerU) 把 Dockerfile 和 compose.yaml 拷贝到本地。这两个文件应该在仓库的 docker 目录可以找到。针对中国供应商的特殊显卡需要选择相应的 Dockerfile 。
+
+准备好上诉两个文件后通过以下命令构建 docker 镜像:
+
+```bash
+docker build --tag mineru:latest .
+```
+
+镜像构建好之后通过以下命令启动 API 服务（参数 `--profile api` 标识仅启动MinerU的 API 服务，服务默认监听 8000 端口）：
+
+```bash
+docker compose -f compose.yaml --profile api up -d
+```
+
+镜像构建细节、GPU 驱动准备、模型权重位置等请参考官方 README：<https://github.com/opendatalab/MinerU>。
+
+**进阶配置：开启 vLLM 预加载与标题层级修正（可选）**
+
+在基础部署之上，建议为本地 MinerU 额外开启两项 MinerU **服务端**功能。这两项都改的是 MinerU 容器侧配置（容器内 `mineru.json` 与官方 `compose.yaml`），不涉及 LightRAG 的 env 变量；其中标题层级修正还需要一个可用的 LLM API。
+
+- **vLLM 启动预加载**：让容器启动时就把 VLM 模型加载进显存，避免首个解析请求承担模型加载延迟。
+- **标题层级修正（`title_aided`）**：MinerU 借助一个外部 LLM 修正解析输出的标题层级，提升结构化产物质量。这对依赖标题结构的 [P（段落语义）分块策略](#25-文件处理选项)尤其有帮助；`P分块策略` 优先按标题分割，标题层级越准确，分块语义越好。
+
+**步骤1：导出并修改 `mineru-lightrag.json`**
+
+从官方镜像中把 `/root/mineru.json` 拷到宿主机当前目录的 `mineru-lightrag.json`（用固定容器名 `temp_mineru`，无需运行容器）：
+
+```bash
+docker create --name temp_mineru mineru:latest
+docker cp temp_mineru:/root/mineru.json ./mineru-lightrag.json
+docker rm temp_mineru
+```
+
+然后修改 `mineru-lightrag.json` 中的 `llm-aided-config.title_aided`：填入 `api_key`，并把 `enable` 改为 `true`：
+
+```json
+"llm-aided-config": {
+    "title_aided": {
+        "api_key": "your_api_key",
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "model": "qwen3.5-plus",
+        "enable_thinking": false,
+        "enable": true
+    }
+}
+```
+
+> `api_key` / `base_url` / `model` 需替换为用户自己可用的 LLM 服务（示例使用阿里云 DashScope 的 OpenAI 兼容接口）。
+
+**步骤2：修改官方 `compose.yaml` 的 `api` profile 服务（`mineru-api`）**
+
+在 `mineru-api` 服务上做三处改动：`environment` 增加 `MINERU_TOOLS_CONFIG_JSON`（让 MinerU 读改过的配置而非镜像内置 `mineru.json`），`volumes` 把宿主机 `mineru-lightrag.json` 挂进容器，`command` 追加 `--enable-vlm-preload true` 开启 vLLM 预加载。改好后的完整 `mineru-api` profile 如下（以 `# <-- 新增` 标注三处增量）：
+
+```yaml
+  mineru-api:
+    image: mineru:latest
+    container_name: mineru-api
+    restart: always
+    profiles: ["api"]
+    ports:
+      - 8000:8000
+    environment:
+      MINERU_MODEL_SOURCE: local
+      MINERU_TOOLS_CONFIG_JSON: /root/mineru-lightrag.json   # <-- Added
+    volumes:
+      - ./mineru-lightrag.json:/root/mineru-lightrag.json    # <-- Added
+    entrypoint: mineru-api
+    command:
+      --host 0.0.0.0
+      --port 8000
+      --allow-public-http-client
+      --gpu-memory-utilization 0.45                          # Reserved 10GB is fine, preventing OOM errors
+      --enable-vlm-preload true                              # <-- Added
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+```
+
+> 示范中请按实际显卡情况调整 `gpu-memory-utilization` ；`environment` / `volumes` / `command` 三处为本次新增项，其余保持官方原样。
+
+**步骤3：重启生效**
+
+改完后重新启动 API 服务让改动生效：
+
+```bash
+docker compose -f compose.yaml --profile api up -d
+```
+
+#### 使用 Docling 文件解析引擎
 
 `docling` 内容提取引擎需要外部的 [docling-serve](https://github.com/DS4SD/docling-serve) 服务（v1 异步 API）。最少配置：
 
@@ -459,7 +650,7 @@ selector → 子字典映射：F → `fixed_token`，R → `recursive_character`
 | `canonical_basename` | 去掉处理提示 hint 后的规范化 basename（例如 `abc.docx`）。文件名查重以此字段为索引 key，保证 `abc.docx` 与 `abc.[native-iet].docx` 视为同一逻辑文档。 |
 | `source_path` | 入队时提供的原始路径（仅当含目录分隔符或绝对路径时才写入），供 `native` / `mineru` / `docling` 解析器定位真实文件位置。 |
 | `parse_format` | 内容格式：`pending_parse`, `raw`, `lightrag`。 |
-| `content` | `raw` 时保存抽取文本；`pending_parse` 时为空字符串；`lightrag` 时存储以 `{{LRdoc}}` 开头的**完整合并文本**（拼接 `.blocks.jsonl` 中所有 `type=="content"` 行的 body 段），分块阶段 `parse_native` 会剥离前缀后再交给 chunking_func，与 `raw` 走完全相同的代码路径。 |
+| `content` | `raw` 时保存抽取文本；`pending_parse` 时为空字符串；`lightrag` 时存储以 `{{LRdoc}}` 开头的**完整合并文本**（拼接 `.blocks.jsonl` 中所有 `type=="content"` 行的 body 段），解析阶段的 reuse handler（`ReuseParser`）会剥离前缀后再交给 chunking_func，与 `raw` 走完全相同的代码路径。 |
 | `content_hash` | 内容 MD5，用于跨文件名查重。`parse_format=raw` 取 `sanitize_text_for_encoding` 后文本的 hash；`parse_format=lightrag` 取 `*.blocks.jsonl` 文件 hash；`parse_format=pending_parse` 不写入，待抽取完成后补上。 |
 | `lightrag_document_path` | `parse_format=lightrag` 时保存结构化 LightRAG Document 的路径；新记录优先保存为相对 `INPUT_DIR` 的路径，例如 `__parsed__/report.docx.parsed/report.blocks.jsonl`。注意路径中的子目录与 blocks 文件名都使用规范化 basename（不含 hint）。 |
 | `parse_engine` | 实际完成抽取的引擎：`legacy`, `native`, `mineru`, `docling`。对于待抽取文件，也可暂存目标引擎。 |
@@ -711,12 +902,13 @@ upload 通过 reservation 后、保存文件前必须双道检查：
 `pipeline_status` 相关的锁解决的是"谁能写"的正确性问题，本节这一组参数解决的是"同时跑几个 worker"的吞吐量问题。流水线分为 3 个阶段，每个阶段的 worker 池数量独立可调：
 
 ```
-          ┌─ q_native  ──► [native parser  × N1] ─┐
-PENDING ─►├─ q_mineru  ──► [mineru parser  × N2] ─┼─► q_analyze ─►[analyzer × N4] ─► q_process ─►[processor × N5]
-          └─ q_docling ──► [docling parser × N3] ─┘
+          ┌─ parse_queues["native"]  ─► [native 池  × N1] ─┐   ← legacy 共享此池
+PENDING ─►├─ parse_queues["mineru"]  ─► [mineru 池  × N2] ─┼─► q_analyze ─►[analyzer × N4] ─► q_process ─►[processor × N5]
+          ├─ parse_queues["docling"] ─► [docling 池 × N3] ─┤
+          └─ parse_queues[<第三方组>] ─► [自定义并发池]  ──┘   ← 按 ParserSpec.queue_group 动态创建
 ```
 
-入队时 `resolve_stored_document_parser_engine` 根据每个文档的 `parser_engine`（来自 `LIGHTRAG_PARSER` 默认值或文件 hint）把它放入对应解析队列；3 个解析队列**完全互不阻塞**——mineru 占满不会拖慢 docling 或 native。解析完成后统一进入 `q_analyze`（多模态分析），再进入 `q_process`（实体/关系抽取 + 入库）。
+解析队列**按注册表的 `ParserSpec.queue_group` 动态创建**（每批取一次注册表快照）：内置 native/mineru/docling 各占一组，legacy 共享 native 池（本地、无网络），第三方引擎可声明独立组与自定义并发数（见 `docs/ThirdPartyParser-zh.md`）。入队时 `resolve_stored_document_parser_engine` 根据每个文档的 `parser_engine`（来自 `LIGHTRAG_PARSER` 默认值或文件 hint）把它放入对应解析队列；各解析队列**完全互不阻塞**——mineru 占满不会拖慢 docling 或 native。解析完成后统一进入 `q_analyze`（多模态分析），再进入 `q_process`（实体/关系抽取 + 入库）。
 
 | 环境变量 | 默认值 | 作用 | 调优建议 |
 | --- | --- | --- | --- |
@@ -762,7 +954,7 @@ PENDING ─►├─ q_mineru  ──► [mineru parser  × N2] ─┼─► q_a
 
 ### 7.2 分支 A：未抽取
 
-走完整流水线（`parse_native` / `parse_mineru` / `parse_docling` → `analyze_multimodal` → 分块 → 实体抽取），按 `full_docs.process_options` 决定每一阶段的行为。这是"首次入队"的常规流。
+走完整流水线（注册表派发解析 `get_parser(engine).parse(...)` → `analyze_multimodal` → 分块 → 实体抽取），按 `full_docs.process_options` 决定每一阶段的行为。这是"首次入队"的常规流。
 
 ### 7.3 分支 B：已抽取
 
