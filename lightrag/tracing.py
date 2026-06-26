@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-import functools
 import logging
 import os
 from dotenv import load_dotenv
@@ -272,8 +271,6 @@ def lf_flush() -> None:
     if not is_tracing_enabled():
         return
     try:
-        from langfuse import get_client
-
         client = lf_get_client()
         if client is not None:
             client.flush()
@@ -287,8 +284,6 @@ def lf_shutdown() -> None:
     if not is_tracing_enabled():
         return
     try:
-        from langfuse import get_client
-
         client = lf_get_client()
         if client is not None:
             client.shutdown()

@@ -135,9 +135,7 @@ from lightrag.utils import (
     normalize_string_list,
 )
 from lightrag.tracing import (
-    lf_observe,
     lf_get_current_trace_context,
-    lf_flush,
     is_tracing_enabled,
 )
 from lightrag.types import KnowledgeGraph

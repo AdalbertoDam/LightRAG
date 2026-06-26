@@ -10,7 +10,6 @@ from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.tracing import (
     lf_observe,
     lf_propagate_attributes,
-    lf_score_current_span,
     lf_update_current_span,
 )
 from lightrag.utils import logger

@@ -2811,7 +2811,7 @@ def create_document_routes(
                         metadata={
                             "workspace": rag.workspace,
                         },
-                        trace_name=f"documents/upload"
+                        trace_name="documents/upload"
                     ):
                         try:
                             await pipeline_index_file(rag, file_path, track_id)
