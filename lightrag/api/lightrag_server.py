@@ -1284,7 +1284,7 @@ def create_app(args):
 
             # Check Tracing status and provision LLM-as-a-Judge evaluators if enabled
             if is_tracing_enabled():
-                from src.evaluation.config.setup_langfuse_evaluators import (
+                from src.evaluation.cli.setup_evaluators import (
                     setup_evaluators,
                 )
 
