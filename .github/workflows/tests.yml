@@ -26,7 +26,7 @@ jobs:
         python-version: ${{ matrix.python-version }}
 
     - name: Cache pip packages
-      uses: actions/cache@v5
+      uses: actions/cache@v6
       with:
         path: ~/.cache/pip
         key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt', '**/pyproject.toml') }}
@@ -42,7 +42,7 @@ jobs:
         # anthropic, boto3, etc.). Without them, importorskip falls back
         # and the tests are silently skipped.
         pip install -e ".[api,offline-storage,offline-llm]"
-        pip install pytest pytest-asyncio
+        pip install pytest pytest-asyncio httpx2
 
     - name: Run offline tests
       run: |
