@@ -496,7 +496,14 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             logger.warning(
                 f"[{self.workspace}] Milvus database '{db_name}' not found, creating it"
             )
-            client.create_database(db_name)
+            try:
+                client.create_database(db_name)
+            except MilvusException as e:
+                if "already exist" not in str(e):
+                    raise
+                logger.debug(
+                    f"[{self.workspace}] Milvus database '{db_name}' already exists — continuing"
+                )
 
         use_database = getattr(client, "use_database", None) or getattr(
             client, "using_database", None
