@@ -55,7 +55,6 @@ from lightrag.utils import (
     move_file_to_parsed_dir,
 )
 from lightrag.tracing import (
-    lf_start_as_current_observation,
     lf_propagate_attributes,
     lf_flush,
     lf_observe,
@@ -2176,22 +2175,17 @@ async def run_scanning_process(
             # selects work by doc_status state and so will also pick up any
             # resume_files in the same run.
             if new_files:
-                async with lf_start_as_current_observation(
-                    name="scan-indexing",
-                    as_type="span",
+                async with lf_propagate_attributes(
+                    trace_name="documents/scan",
+                    tags=["scan", "indexing"],
                     metadata={"files": new_files, "track_id": track_id, "files_status": "new", "workspace": rag.workspace},
                 ):
-                    async with lf_propagate_attributes(
-                        trace_name="documents/scan",
-                        tags=["scan", "indexing"],
-                        metadata={"files": new_files, "track_id": track_id, "files_status": "new", "workspace": rag.workspace},
-                    ):
-                        await pipeline_index_files(
-                            rag,
-                            new_files,
-                            track_id,
-                            from_scan=True,
-                        )
+                    await pipeline_index_files(
+                        rag,
+                        new_files,
+                        track_id,
+                        from_scan=True,
+                    )
 
             # Resume targets must always trigger the pipeline explicitly:
             # pipeline_index_files only runs apipeline_process_enqueue_documents
@@ -2202,18 +2196,12 @@ async def run_scanning_process(
             # enqueue, the inner call already drained the queue and this is a
             # cheap no-op that returns "No documents to process".
             if resume_files:
-                async with lf_start_as_current_observation(
-                    name="scan_indexing",
-                    as_type="span",
+                async with lf_propagate_attributes(
+                    trace_name="documents/scan",
+                    tags=["scan", "indexing"],
                     metadata={"files": new_files, "track_id": track_id, "files_status": "resume", "workspace": rag.workspace},
                 ):
-                    async with lf_propagate_attributes(
-                        trace_name="documents/scan",
-                        tags=["scan", "indexing"],
-                        metadata={"files": new_files, "track_id": track_id, "files_status": "resume", "workspace": rag.workspace},
-                    ):
-                        
-                        await rag.apipeline_process_enqueue_documents()
+                    await rag.apipeline_process_enqueue_documents()
 
             total_active = len(new_files) + len(resume_files)
             if total_active or processed_files:
@@ -2237,7 +2225,12 @@ async def run_scanning_process(
             logger.info(
                 "No upload file found, check if there are any documents in the queue..."
             )
-            await rag.apipeline_process_enqueue_documents()
+            async with lf_propagate_attributes(
+                trace_name="documents/scan",
+                tags=["scan", "indexing"],
+                metadata={"track_id": track_id, "files_status": "queue", "workspace": rag.workspace},
+            ):
+                await rag.apipeline_process_enqueue_documents()
 
     except Exception as e:
         logger.error(f"Error during scanning process: {str(e)}")
