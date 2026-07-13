@@ -4409,38 +4409,60 @@ async def process_chunks_unified(
     # 1. Apply reranking if enabled and query is provided
     if query_param.enable_rerank and query and unique_chunks:
         rerank_top_k = query_param.chunk_top_k or len(unique_chunks)
-        unique_chunks = await apply_rerank_if_enabled(
-            query=query,
-            retrieved_docs=unique_chunks,
-            global_config=global_config,
-            enable_rerank=query_param.enable_rerank,
-            top_n=rerank_top_k,
-        )
-
-    # 2. Filter by minimum rerank score if reranking is enabled
-    if query_param.enable_rerank and unique_chunks:
         min_rerank_score = global_config.get("min_rerank_score", 0.5)
-        if min_rerank_score > 0.0:
-            original_count = len(unique_chunks)
+        async with lf_start_as_current_observation(
+            name="rerank-chunks",
+            as_type="retriever",
+            input={
+                "query": query,
+                "chunk_count": len(unique_chunks),
+                "rerank_top_k": rerank_top_k,
+                "min_rerank_score": min_rerank_score,
+                "source_type": source_type,
+            },
+            metadata={
+                "model": get_env_value("RERANK_MODEL", "unknown"),
+            },
+        ):
+            reranked_chunks = await apply_rerank_if_enabled(
+                query=query,
+                retrieved_docs=unique_chunks,
+                global_config=global_config,
+                enable_rerank=query_param.enable_rerank,
+                top_n=rerank_top_k,
+            )
 
-            # Filter chunks with score below threshold
-            filtered_chunks = []
-            for chunk in unique_chunks:
-                rerank_score = chunk.get(
-                    "rerank_score", 1.0
-                )  # Default to 1.0 if no score
-                if rerank_score >= min_rerank_score:
-                    filtered_chunks.append(chunk)
+        # 2. Filter by minimum rerank score if reranking is enabled
+            if reranked_chunks and min_rerank_score > 0.0:
+                filtered_chunks = []
+                for chunk in reranked_chunks:
+                    if chunk.get("rerank_score", 1.0) >= min_rerank_score:
+                        filtered_chunks.append(chunk)
+                filtered_count = len(reranked_chunks) - len(filtered_chunks)
+                if filtered_count > 0:
+                    logger.info(
+                        f"Rerank filtering: {len(filtered_chunks)} chunks remained (min rerank score: {min_rerank_score})"
+                    )
+            else:
+                filtered_chunks = reranked_chunks
+
+            lf_update_current_span(output={
+                "reranked_chunk_count": len(reranked_chunks),
+                "reranked_chunk_snippets": [
+                    {"text": (c.get("content") or "")[:50] + "...", "score": c.get("rerank_score")}
+                    for c in reranked_chunks[:20]
+                ],
+                "filtered_chunk_count": len(filtered_chunks),
+                "filtered_chunk_snippets": [
+                    {"text": (c.get("content") or "")[:50] + "...", "score": c.get("rerank_score")}
+                    for c in filtered_chunks[:20]
+                ],
+            })
 
             unique_chunks = filtered_chunks
-            filtered_count = original_count - len(unique_chunks)
 
-            if filtered_count > 0:
-                logger.info(
-                    f"Rerank filtering: {len(unique_chunks)} chunks remained (min rerank score: {min_rerank_score})"
-                )
-            if not unique_chunks:
-                return []
+        if not unique_chunks:
+            return []
 
     # 3. Apply chunk_top_k limiting if specified
     if query_param.chunk_top_k is not None and query_param.chunk_top_k > 0:
