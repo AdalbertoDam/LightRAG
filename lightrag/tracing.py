@@ -119,9 +119,57 @@ def lf_get_client() -> Any | None:
     """Return the active Langfuse client, or ``None`` if tracing is disabled."""
     if not is_tracing_enabled():
         return None
-    from langfuse import get_client 
+    from langfuse import get_client
 
     return get_client()
+
+
+def lf_get_trace_url(trace_id: str) -> str | None:
+    """Return a clickable Langfuse UI URL for *trace_id*.
+
+    Delegates to the SDK's own ``Langfuse.get_trace_url()``, which resolves
+    and caches the project id via this instance's own credentials — no
+    project id needs to be configured/duplicated separately.
+
+    The SDK builds the URL from ``LANGFUSE_HOST``/``LANGFUSE_BASE_URL``, which
+    is also the address this process uses to *send* traces — in a Docker
+    setup that's often an internal service hostname the browser can't reach.
+    When ``LANGFUSE_PUBLIC_HOST`` is set, its scheme+host replace the SDK's
+    for the returned URL so links are actually clickable from outside the
+    container network; the path/query (project id, trace id) are untouched.
+
+    Returns ``None`` when tracing is disabled or the SDK can't resolve a URL
+    (e.g. project id lookup failed) — callers should treat this as
+    best-effort.
+    """
+    client = lf_get_client()
+    if client is None:
+        return None
+    try:
+        url = client.get_trace_url(trace_id=trace_id)
+    except Exception as exc:
+        logger.debug("Failed to build Langfuse trace URL: %s", exc)
+        return None
+    if not url:
+        return None
+
+    public_host = os.environ.get("LANGFUSE_PUBLIC_HOST")
+    if not public_host:
+        return url
+
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(url)
+    public_parts = urlsplit(public_host.rstrip("/"))
+    return urlunsplit(
+        (
+            public_parts.scheme or parts.scheme,
+            public_parts.netloc or parts.netloc,
+            parts.path,
+            parts.query,
+            parts.fragment,
+        )
+    )
 
 
 def lf_update_current_span(**kwargs: Any) -> None:
