@@ -2324,7 +2324,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         for similarity search must run an explicit flush first.
         """
         # Ensure collection is loaded before querying
-        self._ensure_collection_loaded()
+        await asyncio.to_thread(self._ensure_collection_loaded)
 
         # Use provided embedding or compute it
         if query_embedding is not None:
@@ -2349,7 +2349,8 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             },
         }
 
-        results = self._client.search(
+        results = await asyncio.to_thread(
+            self._client.search,
             collection_name=self.final_namespace,
             data=embedding,
             limit=top_k,
@@ -2565,8 +2566,10 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                             f"[{self.workspace}] Milvus upsert batch {batch_index}/{len(upsert_batches)}: "
                             f"records={len(records_batch)}, estimated_payload_bytes={estimated_bytes}"
                         )
-                        self._client.upsert(
-                            collection_name=self.final_namespace, data=records_batch
+                        await asyncio.to_thread(
+                            self._client.upsert,
+                            collection_name=self.final_namespace,
+                            data=records_batch,
                         )
                 if pending_deletes:
                     # Chunk deletes by record count; pks are short strings so a
@@ -2578,7 +2581,8 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                         else len(delete_ids)
                     )
                     for i in range(0, len(delete_ids), delete_chunk):
-                        self._client.delete(
+                        await asyncio.to_thread(
+                            self._client.delete,
                             collection_name=self.final_namespace,
                             pks=delete_ids[i : i + delete_chunk],
                         )
@@ -2651,10 +2655,11 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 _prune_pending()
                 return
 
-            self._ensure_collection_loaded()
+            await asyncio.to_thread(self._ensure_collection_loaded)
 
             expr = f'src_id == "{entity_name}" or tgt_id == "{entity_name}"'
-            results = self._client.query(
+            results = await asyncio.to_thread(
+                self._client.query,
                 collection_name=self.final_namespace,
                 filter=expr,
                 output_fields=["id"],
@@ -2670,7 +2675,11 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 return
 
             relation_ids = [item["id"] for item in results]
-            self._client.delete(collection_name=self.final_namespace, pks=relation_ids)
+            await asyncio.to_thread(
+                self._client.delete,
+                collection_name=self.final_namespace,
+                pks=relation_ids,
+            )
             # Server-side delete succeeded — safe to prune the pending
             # buffer so subsequent flushes don't re-upsert the deleted
             # relations.
@@ -2706,12 +2715,13 @@ class MilvusVectorDBStorage(BaseVectorStorage):
 
         try:
             # Ensure collection is loaded before querying
-            self._ensure_collection_loaded()
+            await asyncio.to_thread(self._ensure_collection_loaded)
 
             # Include all meta_fields (created_at is now always included) plus id
             output_fields = list(self.meta_fields) + ["id"]
 
-            result = self._client.query(
+            result = await asyncio.to_thread(
+                self._client.query,
                 collection_name=self.final_namespace,
                 filter=f'id == "{id}"',
                 output_fields=output_fields,
@@ -2751,7 +2761,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         if remaining:
             try:
                 # Ensure collection is loaded before querying
-                self._ensure_collection_loaded()
+                await asyncio.to_thread(self._ensure_collection_loaded)
 
                 # Include all meta_fields (created_at is now always included) plus id
                 output_fields = list(self.meta_fields) + ["id"]
@@ -2759,7 +2769,8 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 id_list = '", "'.join(remaining)
                 filter_expr = f'id in ["{id_list}"]'
 
-                result = self._client.query(
+                result = await asyncio.to_thread(
+                    self._client.query,
                     collection_name=self.final_namespace,
                     filter=filter_expr,
                     output_fields=output_fields,
@@ -2847,12 +2858,13 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             return result
 
         try:
-            self._ensure_collection_loaded()
+            await asyncio.to_thread(self._ensure_collection_loaded)
 
             id_list = '", "'.join(remaining)
             filter_expr = f'id in ["{id_list}"]'
 
-            rows = self._client.query(
+            rows = await asyncio.to_thread(
+                self._client.query,
                 collection_name=self.final_namespace,
                 filter=filter_expr,
                 output_fields=["id", "vector"],
