@@ -1205,7 +1205,27 @@ class MongoGraphStorage(BaseGraphStorage):
 
         indexes_cursor = await self.edge_collection.list_indexes()
         existing_indexes = await indexes_cursor.to_list(length=None)
-        if any(idx.get("name") == index_name for idx in existing_indexes):
+        existing_index_names = {idx.get("name", "") for idx in existing_indexes}
+
+        # Single-field indexes backing node_degree/node_degrees_batch/
+        # get_node_edges/get_nodes_edges_batch, all of which $match or $in on
+        # these fields. Without them every one of those calls is a full
+        # COLLSCAN; harmless with one query in flight but concurrent queries
+        # each doing a full scan contend for WiredTiger cache/IO and stall.
+        # Ensured unconditionally (not gated behind the migration below) so
+        # already-migrated deployments still pick them up.
+        source_index_name = f"{workspace_prefix}source_node_id"
+        target_index_name = f"{workspace_prefix}target_node_id"
+        if source_index_name not in existing_index_names:
+            await self.edge_collection.create_index(
+                [("source_node_id", 1)], name=source_index_name
+            )
+        if target_index_name not in existing_index_names:
+            await self.edge_collection.create_index(
+                [("target_node_id", 1)], name=target_index_name
+            )
+
+        if index_name in existing_index_names:
             logger.info(
                 f"[{self.workspace}] Edge collection {self._edge_collection_name} "
                 f"already on canonical edge endpoints; skipping migration"
@@ -1606,6 +1626,54 @@ class MongoGraphStorage(BaseGraphStorage):
             ) + doc.get("degree")
 
         return merged_results
+
+    async def edge_degrees_batch(
+        self, edge_pairs: list[tuple[str, str]]
+    ) -> dict[tuple[str, str], int]:
+        # Node degrees are already batched; sum them locally instead of
+        # issuing one edge_degree() round-trip per pair.
+        node_ids = {node_id for pair in edge_pairs for node_id in pair}
+        degrees = await self.node_degrees_batch(list(node_ids))
+
+        result = {}
+        for src_id, tgt_id in edge_pairs:
+            result[(src_id, tgt_id)] = degrees.get(src_id, 0) + degrees.get(
+                tgt_id, 0
+            )
+        return result
+
+    async def get_edges_batch(
+        self, pairs: list[dict[str, str]]
+    ) -> dict[tuple[str, str], dict]:
+        # Map canonical (edge_lo, edge_hi) back to the requested (src, tgt)
+        # direction, since multiple requested pairs can share one canonical edge.
+        canonical_to_requested: dict[tuple[str, str], list[tuple[str, str]]] = {}
+        for pair in pairs:
+            src_id = pair["src"]
+            tgt_id = pair["tgt"]
+            canonical = _canonical_edge_endpoints(src_id, tgt_id)
+            canonical_to_requested.setdefault(canonical, []).append(
+                (src_id, tgt_id)
+            )
+
+        result = {}
+        if not canonical_to_requested:
+            return result
+
+        cursor = self.edge_collection.find(
+            {
+                "$or": [
+                    {"edge_lo": edge_lo, "edge_hi": edge_hi}
+                    for edge_lo, edge_hi in canonical_to_requested
+                ]
+            }
+        )
+        async for doc in cursor:
+            doc.pop("_id", None)
+            canonical = (doc["edge_lo"], doc["edge_hi"])
+            for src_id, tgt_id in canonical_to_requested.get(canonical, []):
+                result[(src_id, tgt_id)] = doc
+        return result
 
     async def get_nodes_edges_batch(
         self, node_ids: list[str]
