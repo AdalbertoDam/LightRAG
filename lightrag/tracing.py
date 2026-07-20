@@ -338,3 +338,16 @@ def lf_shutdown() -> None:
             logger.debug("Langfuse client shut down")
     except Exception as exc:
         logger.warning("Failed to shut down Langfuse client: %s", exc)
+
+
+def _query_stream_trace_ctx(rag, request, param):
+    """Context manager to propagate tracing attributes for the query stream operation."""
+    return lf_propagate_attributes(
+        tags=["query", f"workspace:{rag.workspace}", f"query_mode:{request.mode}", f"streaming:{param.stream}"],
+        trace_name="query/stream",
+        metadata={
+            "query_mode": request.mode,
+            "streaming": str(param.stream),
+            "workspace": rag.workspace,
+        },
+    )
