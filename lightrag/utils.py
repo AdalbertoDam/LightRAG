@@ -4507,6 +4507,11 @@ async def apply_rerank_if_enabled(
 
     except Exception as e:
         logger.error(f"Error during reranking: {e}, using original chunks")
+        lf_update_current_span(
+            level="ERROR",
+            status_message=str(e),
+            metadata={"rerank_fallback": True},
+        )
         return retrieved_docs
 
 
