@@ -10,7 +10,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from lightrag.base import QueryParam
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.tracing import (
-    lf_observe,
     lf_propagate_attributes,
     lf_update_current_span,
     _query_stream_trace_ctx,
@@ -373,7 +372,6 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    @lf_observe(name="query-text", capture_input=False, capture_output=True)
     async def query_text(request: QueryRequest):
         """
         Comprehensive RAG query endpoint with non-streaming response. Parameter "stream" is ignored.
@@ -456,24 +454,24 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             )  # Ensure stream=False for non-streaming endpoint
             # Force stream=False for /query endpoint regardless of include_references setting
             param.stream = False
-            lf_update_current_span(input={"query": request.query, "mode": request.mode})
-
             # Unified approach: always use aquery_llm for both cases
             async with lf_propagate_attributes(
                 tags=["query", f"workspace:{rag.workspace}", f"query_mode:{request.mode}", f"streaming:{param.stream}"],
                 trace_name="query/query",
-                metadata={
-                    "query_mode": request.mode,
-                    "streaming": str(param.stream),
-                    "workspace": rag.workspace,
-                }
             ):
                 start_time = time.perf_counter()
                 result = await rag.aquery_llm(request.query, param=param)
                 lf_update_current_span(
+                    metadata={
+                        "retrieval_status": result.get("status"),
+                        "retrieval_metadata": result.get("metadata", {}),
+                        "query_mode": request.mode,
+                        "streaming": str(param.stream),
+                        "workspace": rag.workspace,
+                    },
                     input={"query": request.query, "mode": request.mode},
                     output={k: v for k, v in result.items() if k != "llm_response"}
-                )            
+                )
                 response_time = round(time.perf_counter() - start_time, 3)
 
             # Extract LLM response and references from unified result
@@ -678,7 +676,6 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    @lf_observe(name="query-text-stream", capture_input=False, capture_output=False)
     async def query_text_stream(request: QueryRequest):
         """
         Advanced RAG query endpoint with flexible streaming response.
@@ -1256,7 +1253,6 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    @lf_observe(name="query-data", capture_input=False, capture_output=True)
     async def query_data(request: QueryRequest):
         """
         Advanced data retrieval endpoint for structured RAG analysis.
@@ -1387,15 +1383,17 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                     )
 
                 _submit_retrieval_scores(response)
-                return QueryDataResponse(**response)
+                result_response = QueryDataResponse(**response)
             else:
                 # Handle unexpected response format
-                return QueryDataResponse(
+                result_response = QueryDataResponse(
                     status="failure",
                     message="Invalid response type",
                     data={},
                     metadata={},
                 )
+            lf_update_current_span(output=result_response.model_dump())
+            return result_response
         except Exception as e:
             logger.error(f"Error processing data query: {str(e)}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))

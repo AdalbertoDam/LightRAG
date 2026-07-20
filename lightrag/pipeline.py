@@ -87,7 +87,6 @@ from lightrag.tracing import (
     lf_observe,
     lf_start_as_current_observation,
     lf_update_current_span,
-    lf_propagate_attributes,
 )
 from lightrag.utils_pipeline import (
     # Re-exported through the pipeline namespace (not used by this module
@@ -2941,18 +2940,11 @@ class _PipelineMixin:
                                 "chunk_count": str(len(chunks)),
                             },
                         ):
-                            async with lf_propagate_attributes(
-                                metadata={
-                                    "docid": doc_id,
-                                    "filepath": file_path,
-                                    "chunkcount": str(len(chunks)),
-                                },
-                            ):
-                                return await self._process_extract_entities(
-                                    chunks,
-                                    ctx.pipeline_status,
-                                    ctx.pipeline_status_lock,
-                                )
+                            return await self._process_extract_entities(
+                                chunks,
+                                ctx.pipeline_status,
+                                ctx.pipeline_status_lock,
+                            )
 
                     entity_relation_task = asyncio.create_task(_extract_entities())
                     chunk_results = await entity_relation_task
@@ -3002,31 +2994,24 @@ class _PipelineMixin:
                                 "chunk_count": str(len(chunks)),
                             },
                         ):
-                            async with lf_propagate_attributes(
-                                metadata={
-                                    "docid": doc_id,
-                                    "filepath": file_path,
-                                    "chunkcount": str(len(chunks)),
-                                },
-                            ):
-                                await merge_nodes_and_edges(
-                                    chunk_results=chunk_results,
-                                    knowledge_graph_inst=self.chunk_entity_relation_graph,
-                                    entity_vdb=self.entities_vdb,
-                                    relationships_vdb=self.relationships_vdb,
-                                    global_config=self._build_global_config(),
-                                    full_entities_storage=self.full_entities,
-                                    full_relations_storage=self.full_relations,
-                                    doc_id=doc_id,
-                                    pipeline_status=ctx.pipeline_status,
-                                    pipeline_status_lock=ctx.pipeline_status_lock,
-                                    llm_response_cache=self.llm_response_cache,
-                                    entity_chunks_storage=self.entity_chunks,
-                                    relation_chunks_storage=self.relation_chunks,
-                                    current_file_number=current_file_number,
-                                    total_files=ctx.total_files,
-                                    file_path=file_path,
-                                )
+                            await merge_nodes_and_edges(
+                                chunk_results=chunk_results,
+                                knowledge_graph_inst=self.chunk_entity_relation_graph,
+                                entity_vdb=self.entities_vdb,
+                                relationships_vdb=self.relationships_vdb,
+                                global_config=self._build_global_config(),
+                                full_entities_storage=self.full_entities,
+                                full_relations_storage=self.full_relations,
+                                doc_id=doc_id,
+                                pipeline_status=ctx.pipeline_status,
+                                pipeline_status_lock=ctx.pipeline_status_lock,
+                                llm_response_cache=self.llm_response_cache,
+                                entity_chunks_storage=self.entity_chunks,
+                                relation_chunks_storage=self.relation_chunks,
+                                current_file_number=current_file_number,
+                                total_files=ctx.total_files,
+                                file_path=file_path,
+                            )
 
                     # If another in-flight document already triggered an abort
                     # (e.g. a storage flush error set cancellation_requested),

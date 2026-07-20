@@ -57,8 +57,8 @@ from lightrag.utils import (
 from lightrag.tracing import (
     lf_propagate_attributes,
     lf_flush,
-    lf_observe,
     lf_update_current_span,
+    lf_start_as_current_observation,
 )
 from lightrag.api.utils_api import get_combined_auth_dependency
 from ..config import global_args
@@ -3151,7 +3151,6 @@ def create_document_routes(
     @router.post(
         "/text", response_model=InsertResponse, dependencies=[Depends(combined_auth)]
     )
-    @lf_observe(name="insert-text", as_type="span", capture_input=False)
     async def insert_text(
         request: InsertTextRequest,
         managed_tasks: set = Depends(get_managed_background_tasks),
@@ -3234,27 +3233,47 @@ def create_document_routes(
                 # start-barrier confirms takeover before returning; a body-send
                 # cancellation therefore cannot strand the enqueue slot.
                 started.set()
-                async with lf_propagate_attributes(
-                    tags=["insert-text", "indexing"],
+                # A dedicated span is opened here (inside the background task)
+                # rather than relying solely on the middleware's "insert-text"
+                # span: start_reserved_background_task returns as soon as
+                # started.set() fires, so the HTTP response — and with it the
+                # middleware span — completes almost immediately, well before
+                # pipeline_index_texts actually runs. Setting output= on an
+                # already-ended span silently no-ops, so this span's own
+                # lifetime is tied to the task instead.
+                async with lf_start_as_current_observation(
+                    name="documents/text",
                     metadata={
-                        "document_count": "1",
-                        "text_snippet": request.text[:10], 
+                        "document_count": 1,
+                        "text_snippet": request.text[:10],
                         "file_source": normalized_file_source,
                         "workspace": rag.workspace,
                     },
-                    trace_name="documents/text"
                 ):
-                    try:
-                        await pipeline_index_texts(
-                            rag,
-                            [request.text],
-                            file_sources=[normalized_file_source],
-                            track_id=track_id,
-                            chunking=request.chunking,
-                        )
-                    finally:
-                        await _release_enqueue_slot(rag, enqueue_token)
-                        lf_flush()
+                    async with lf_propagate_attributes(
+                        tags=["insert-text", "indexing"],
+                        metadata={
+                            "document_count": "1",
+                            "text_snippet": request.text[:10],
+                            "file_source": normalized_file_source,
+                            "workspace": rag.workspace,
+                        },
+                        trace_name="documents/text"
+                    ):
+                        try:
+                            await pipeline_index_texts(
+                                rag,
+                                [request.text],
+                                file_sources=[normalized_file_source],
+                                track_id=track_id,
+                                chunking=request.chunking,
+                            )
+                            lf_update_current_span(
+                                output={"status": "success", "document_count": 1}
+                            )
+                        finally:
+                            await _release_enqueue_slot(rag, enqueue_token)
+                            lf_flush()
 
 
             async def _enqueue_backstop():
@@ -3287,7 +3306,6 @@ def create_document_routes(
         response_model=InsertResponse,
         dependencies=[Depends(combined_auth)],
     )
-    @lf_observe(name="insert-texts", as_type="span", capture_input=False)
     async def insert_texts(
         request: InsertTextsRequest,
         managed_tasks: set = Depends(get_managed_background_tasks),
@@ -3329,8 +3347,6 @@ def create_document_routes(
             # Reject batch text insertion while a scan is in progress AND
             # reserve a pending-enqueue slot — see /upload for the rationale.
             await _reserve_enqueue_slot(rag, enqueue_token)
-
-            lf_update_current_span(input={"file_sources": request.file_sources, "document_count": len(request.texts)})
 
             # Check if any file_sources already exist in doc_status storage
             if not request.file_sources or len(request.file_sources) != len(
@@ -3385,17 +3401,24 @@ def create_document_routes(
             # Generate track_id for texts insertion
             track_id = generate_track_id("insert")
 
+            lf_update_current_span(
+                input={
+                    "file_sources": normalized_file_sources,
+                    "document_count": len(request.texts),
+                }
+            )
+
             async def _indexing_work(started):
                 # started.set() first (no await before it) so the endpoint's
                 # start-barrier confirms takeover before returning; a body-send
                 # cancellation therefore cannot strand the enqueue slot.
                 started.set()
+
                 async with lf_propagate_attributes(
                     tags=["insert-texts", "indexing"],
                     metadata={
                         "document_count": str(len(request.texts)),
-                        "file_sources": normalized_file_sources,
-                        "text_snippets": [text[:10] for text in request.texts],
+                        "file_sources": ", ".join(normalized_file_sources)[:200],
                         "workspace": rag.workspace,
                     },
                     trace_name="documents/texts"

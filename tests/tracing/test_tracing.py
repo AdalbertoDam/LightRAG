@@ -708,29 +708,25 @@ class TestPipelineTracing:
 # ---------------------------------------------------------------------------
 
 class TestQueryRouteDecorators:
+    """Root-span creation for these routes now lives in
+    src/app/langfuse_trace_middleware.py (outside this submodule) — routes
+    only update the span the middleware already opened via
+    lf_update_current_span, and nest inner trace-attribute propagation via
+    lf_propagate_attributes. No route handler should carry its own
+    @lf_observe decorator anymore.
+    """
 
-    def test_lf_observe_and_propagate_present(self):
+    def test_query_routes_no_longer_use_lf_observe(self):
         src = (_routers_dir() / "query_routes.py").read_text()
-        assert "lf_observe" in src
+        assert "lf_observe" not in src
         assert "lf_propagate_attributes" in src
+        assert "lf_update_current_span" in src
 
-    def test_all_three_query_span_names_present(self):
-        src = (_routers_dir() / "query_routes.py").read_text()
-        for span_name in ("query-text", "query-text-stream", "query-data"):
-            assert span_name in src, f"Missing span name: {span_name}"
-
-    def test_document_route_span_names_present(self):
+    def test_document_routes_no_longer_use_lf_observe(self):
         src = (_routers_dir() / "document_routes.py").read_text()
-        for span_name in ("insert-text", "insert-texts"):
-            assert span_name in src, f"Missing span name: {span_name}"
-
-    def test_document_routes_use_lf_propagate_attributes(self):
-        src = (_routers_dir() / "document_routes.py").read_text()
+        assert "lf_observe" not in src
         assert "lf_propagate_attributes" in src
-
-    def test_document_routes_use_lf_start_as_current_observation(self):
-        src = (_routers_dir() / "document_routes.py").read_text()
-        assert "lf_start_as_current_observation" in src
+        assert "lf_update_current_span" in src
 
 
 # ---------------------------------------------------------------------------
