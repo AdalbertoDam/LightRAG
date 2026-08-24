@@ -6,16 +6,29 @@ import asyncio
 import json
 import time
 from typing import Any, Dict, List, Literal, Optional
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from lightrag.base import QueryParam
-from lightrag.api.utils_api import get_combined_auth_dependency
+from lightrag.api.input_limits import count_conversation_input_chars
+from lightrag.api.utils_api import get_combined_auth_dependency, internal_server_error
+from lightrag.constants import (
+    MAX_KEYWORD_CHARS,
+    MAX_KEYWORDS_PER_LIST,
+    MAX_MESSAGE_CHARS,
+    MAX_MESSAGES_PER_REQUEST,
+    MAX_QUERY_CHARS,
+    MAX_QUERY_TOKEN_BUDGET,
+    MAX_QUERY_TOP_K,
+    MAX_REQUEST_TEXT_CHARS,
+    MAX_RESPONSE_TYPE_CHARS,
+    MAX_ROLE_CHARS,
+)
 from lightrag.tracing import (
     lf_propagate_attributes,
     lf_update_current_span,
     _query_stream_trace_ctx,
 )
 from lightrag.utils import logger
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from lightrag.scores import _submit_retrieval_scores  
 from dataclasses import asdict
@@ -23,6 +36,7 @@ from dataclasses import asdict
 class QueryRequest(BaseModel):
     query: str = Field(
         min_length=3,
+        max_length=MAX_QUERY_CHARS,
         description="The query text",
     )
 
@@ -43,18 +57,21 @@ class QueryRequest(BaseModel):
 
     response_type: Optional[str] = Field(
         min_length=1,
+        max_length=MAX_RESPONSE_TYPE_CHARS,
         default=None,
         description="Defines the response format. Examples: 'Multiple Paragraphs', 'Single Paragraph', 'Bullet Points'.",
     )
 
     top_k: Optional[int] = Field(
         ge=1,
+        le=MAX_QUERY_TOP_K,
         default=None,
         description="Number of top items to retrieve. Represents entities in 'local' mode and relationships in 'global' mode.",
     )
 
     chunk_top_k: Optional[int] = Field(
         ge=1,
+        le=MAX_QUERY_TOP_K,
         default=None,
         description="Number of text chunks to retrieve initially from vector search and keep after reranking.",
     )
@@ -63,27 +80,32 @@ class QueryRequest(BaseModel):
         default=None,
         description="Maximum number of tokens allocated for entity context in unified token control system.",
         ge=1,
+        le=MAX_QUERY_TOKEN_BUDGET,
     )
 
     max_relation_tokens: Optional[int] = Field(
         default=None,
         description="Maximum number of tokens allocated for relationship context in unified token control system.",
         ge=1,
+        le=MAX_QUERY_TOKEN_BUDGET,
     )
 
     max_total_tokens: Optional[int] = Field(
         default=None,
         description="Maximum total tokens budget for the entire query context (entities + relations + chunks + system prompt).",
         ge=1,
+        le=MAX_QUERY_TOKEN_BUDGET,
     )
 
     hl_keywords: list[str] = Field(
         default_factory=list,
+        max_length=MAX_KEYWORDS_PER_LIST,
         description="List of high-level keywords to prioritize in retrieval. Leave empty to use the LLM to generate the keywords.",
     )
 
     ll_keywords: list[str] = Field(
         default_factory=list,
+        max_length=MAX_KEYWORDS_PER_LIST,
         description="List of low-level keywords to refine retrieval focus. Leave empty to use the LLM to generate the keywords.",
     )
 
@@ -94,6 +116,7 @@ class QueryRequest(BaseModel):
 
     user_prompt: Optional[str] = Field(
         default=None,
+        max_length=MAX_QUERY_CHARS,
         description="User-provided prompt for the query. If provided, this will be used instead of the default value from prompt template.",
     )
 
@@ -130,7 +153,21 @@ class QueryRequest(BaseModel):
     @field_validator("query", mode="after")
     @classmethod
     def query_strip_after(cls, query: str) -> str:
-        return query.strip()
+        # min_length runs before strip; re-check so pads cannot shrink below 3 chars.
+        stripped = query.strip()
+        if len(stripped) < 3:
+            raise ValueError("query must be at least 3 characters after stripping")
+        return stripped
+
+    @field_validator("hl_keywords", "ll_keywords", mode="after")
+    @classmethod
+    def keywords_length_check(cls, keywords: list[str]) -> list[str]:
+        for keyword in keywords:
+            if len(keyword) > MAX_KEYWORD_CHARS:
+                raise ValueError(
+                    f"each keyword must be at most {MAX_KEYWORD_CHARS} characters"
+                )
+        return keywords
 
     @field_validator("conversation_history", mode="after")
     @classmethod
@@ -139,12 +176,54 @@ class QueryRequest(BaseModel):
     ) -> List[Dict[str, Any]] | None:
         if conversation_history is None:
             return None
+        if len(conversation_history) > MAX_MESSAGES_PER_REQUEST:
+            raise ValueError(
+                f"conversation_history must hold at most {MAX_MESSAGES_PER_REQUEST} messages"
+            )
         for msg in conversation_history:
             if "role" not in msg:
                 raise ValueError("Each message must have a 'role' key.")
             if not isinstance(msg["role"], str) or not msg["role"].strip():
                 raise ValueError("Each message 'role' must be a non-empty string.")
+            if len(msg["role"]) > MAX_ROLE_CHARS:
+                raise ValueError(
+                    f"Each message 'role' must be at most {MAX_ROLE_CHARS} characters."
+                )
+            if "content" not in msg:
+                raise ValueError("Each message must have a 'content' key.")
+            if not isinstance(msg["content"], str):
+                raise ValueError("Each message 'content' must be a string.")
+            if len(msg["content"]) > MAX_MESSAGE_CHARS:
+                raise ValueError(
+                    f"Each message 'content' must be at most {MAX_MESSAGE_CHARS} characters."
+                )
+
+        # Extra keys stay allowed on purpose — clients following the OpenAI
+        # convention send 'name' or 'tool_call_id'. The aggregate validator
+        # counts the serialized whole, so those fields consume request budget
+        # without being forbidden outright.
         return conversation_history
+
+    @model_validator(mode="after")
+    def bound_aggregate_text(self) -> "QueryRequest":
+        """Bound all model-facing request input in one request.
+
+        Per-field limits are not a bound on their own: the same payload is
+        trivially rebuilt out of fields that are each individually legal. Every
+        history dict is forwarded verbatim, so count its serialized form rather
+        than only the ``content`` key.
+        """
+        total = count_conversation_input_chars(
+            self.query,
+            self.user_prompt,
+            self.conversation_history,
+        )
+        if total > MAX_REQUEST_TEXT_CHARS:
+            raise ValueError(
+                f"total request text is {total} characters, over the "
+                f"{MAX_REQUEST_TEXT_CHARS} character limit"
+            )
+        return self
 
     def to_query_params(self, is_stream: bool) -> "QueryParam":
         """Converts a QueryRequest instance into a QueryParam instance."""
@@ -522,7 +601,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 )
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
+            raise internal_server_error(e)
 
     def _build_stream_generator(
         *,
@@ -955,7 +1034,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 )
         except Exception as e:
             logger.error(f"Error processing streaming query: {str(e)}", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
+            raise internal_server_error(e)
 
     @router.post(
         "/query/data",
@@ -1107,7 +1186,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                                                 "tgt_id": "Machine Learning",
                                                 "description": "Neural networks are a subset of machine learning algorithms",
                                                 "keywords": "subset, algorithm, learning",
-                                                "weight": 0.85,
+                                                "weight": 1.0,
                                                 "source_id": "chunk-123",
                                                 "file_path": "/documents/ai_basics.pdf",
                                                 "reference_id": "1",
@@ -1162,7 +1241,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                                                 "tgt_id": "Machine Learning",
                                                 "description": "AI encompasses machine learning as a core component",
                                                 "keywords": "encompasses, component, field",
-                                                "weight": 0.92,
+                                                "weight": 2.0,
                                                 "source_id": "chunk-456",
                                                 "file_path": "/documents/ai_overview.pdf",
                                                 "reference_id": "2",
@@ -1396,6 +1475,6 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             return result_response
         except Exception as e:
             logger.error(f"Error processing data query: {str(e)}", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
+            raise internal_server_error(e)
 
     return router

@@ -10,8 +10,9 @@
     "documents": "文件",
     "knowledgeGraph": "知識圖譜",
     "retrieval": "檢索",
-    "api": "API",
+    "apiDocs": "API 文件",
     "projectRepository": "專案庫",
+    "appSettings": "設定",
     "logout": "登出",
     "frontendNeedsRebuild": "前端程式碼需重新建置",
     "themeToggle": {
@@ -37,7 +38,10 @@
     "cancel": "取消",
     "save": "儲存",
     "saving": "儲存中...",
-    "saveFailed": "儲存失敗"
+    "saveFailed": "儲存失敗",
+    "errorBoundaryTitle": "發生錯誤",
+    "errorBoundaryDescription": "此面板無法顯示。請重試，或切換到其他分頁。",
+    "errorBoundaryRetry": "重試"
   },
   "documentPanel": {
     "clearDocuments": {
@@ -99,7 +103,7 @@
         "error": "部分檔案上傳失敗"
       },
       "generalError": "上傳失敗\n{{error}}",
-      "fileTypes": "支援的檔案類型：TXT, MD, TEXTPACK, MDX, DOCX, PDF, PPTX, XLSX, RTF, ODT, EPUB, HTML, HTM, TEX, JSON, XML, YAML, YML, CSV, LOG, CONF, INI, PROPERTIES, SQL, BAT, SH, C, CPP, H, HPP, PY, JAVA, JS, TS, SWIFT, GO, RB, PHP, CSS, SCSS, LESS",
+      "fileTypes": "支援的檔案類型：{{types}}",
       "fileUploader": {
         "singleFileLimit": "一次只能上傳一個檔案",
         "maxFilesLimit": "最多只能上傳 {{count}} 個檔案",
@@ -139,18 +143,18 @@
       "filters": {
         "all": "全部",
         "completed": "已完成",
-        "parse": "內容解析",
+        "parse": "文件解析",
         "analyze": "模態分析",
-        "process": "抽取處理",
+        "process": "圖譜處理",
         "failed": "失敗"
       },
       "status": {
         "all": "全部",
         "completed": "已完成",
         "preprocessed": "預處理",
-        "parsing": "內容擷取",
-        "analyzing": "分析中",
-        "processing": "處理中",
+        "parsing": "文件解析",
+        "analyzing": "模態分析",
+        "processing": "圖譜處理",
         "pending": "等待中",
         "failed": "失敗"
       },
@@ -177,7 +181,6 @@
     "pipelineStatus": {
       "title": "流水線狀態",
       "busy": "流水線忙碌",
-      "requestPending": "待處理請求",
       "cancellationRequested": "取消請求",
       "jobName": "作業名稱",
       "startTime": "開始時間",
@@ -330,6 +333,7 @@
       "editPropertyDescription": "在下方文字區域編輯屬性值。",
       "errors": {
         "duplicateName": "節點名稱已存在",
+        "invalidEntityName": "請輸入有效的節點名稱",
         "updateFailed": "更新節點失敗",
         "tryAgainLater": "請稍後重試",
         "updateSuccessButMergeFailed": "屬性已更新，但合併失敗：{{error}}",
@@ -424,6 +428,7 @@
     },
     "retrieval": {
       "startPrompt": "輸入查詢開始檢索",
+      "scrollToBottom": "回到最新訊息",
       "clear": "清空",
       "send": "送出",
       "stop": "停止",
@@ -481,9 +486,6 @@
       "maxTotalTokens": "總詞元數上限",
       "maxTotalTokensTooltip": "整個查詢上下文的最大總詞元預算（實體+關係+文檔塊+系統提示）"
     }
-  },
-  "apiSite": {
-    "loading": "正在載入 API 文件..."
   },
   "apiKeyAlert": {
     "title": "需要 API key",

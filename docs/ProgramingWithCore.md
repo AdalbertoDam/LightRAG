@@ -67,15 +67,16 @@ Notes:
 
 | **Parameter** | **Type** | **Explanation** | **Default** |
 | -------------- | ---------- | ----------------- | ------------- |
-| **working_dir** | `str` | Directory where the cache will be stored | `lightrag_cache+timestamp` |
+| **working_dir** | `str` | Directory where the cache will be stored | `./rag_storage` |
 | **workspace** | str | Workspace name for data isolation between different LightRAG Instances | |
 | **kv_storage** | `str` | Storage type for documents and text chunks. Supported types: `JsonKVStorage`,`PGKVStorage`,`RedisKVStorage`,`MongoKVStorage`,`OpenSearchKVStorage` | `JsonKVStorage` |
 | **vector_storage** | `str` | Storage type for embedding vectors. Supported types: `NanoVectorDBStorage`,`PGVectorStorage`,`MilvusVectorDBStorage`,`ChromaVectorDBStorage`,`FaissVectorDBStorage`,`MongoVectorDBStorage`,`QdrantVectorDBStorage`,`OpenSearchVectorDBStorage` | `NanoVectorDBStorage` |
-| **graph_storage** | `str` | Storage type for graph edges and nodes. Supported types: `NetworkXStorage`,`Neo4JStorage`,`PGGraphStorage`,`AGEStorage`,`OpenSearchGraphStorage` | `NetworkXStorage` |
+| **graph_storage** | `str` | Storage type for graph edges and nodes. Supported types: `NetworkXStorage`,`Neo4JStorage`,`PGGraphStorage`,`PGTableGraphStorage`,`AGEStorage`,`OpenSearchGraphStorage` | `NetworkXStorage` |
 | **doc_status_storage** | `str` | Storage type for documents process status. Supported types: `JsonDocStatusStorage`,`PGDocStatusStorage`,`MongoDocStatusStorage`,`OpenSearchDocStatusStorage` | `JsonDocStatusStorage` |
 | **chunk_token_size** | `int` | Maximum token size per chunk when splitting documents | `1200` |
 | **chunk_overlap_token_size** | `int` | Overlap token size between two chunks when splitting documents | `100` |
-| **tokenizer** | `Tokenizer` | The function used to convert text into tokens (numbers) and back using .encode() and .decode() functions following `TokenizerInterface` protocol. If you don't specify one, it will use the default Tiktoken tokenizer. | `TiktokenTokenizer` |
+| **embedding_chunk_overlap_token_size** | `int` | Overlap token size the embedding hard fallback borrows from the previous window when a chunk is still over the embedding model's context limit after chunking. Independent from `chunk_overlap_token_size` (some chunking strategies, e.g. V, deliberately zero that one out for unrelated reasons); `0` disables the fallback's overlap; negative values raise `ValueError` at construction. Configured by env var `EMBEDDING_CHUNK_OVERLAP_TOKEN_SIZE`. | `100` |
+| **tokenizer** | `Tokenizer` | The function used to convert text into tokens (numbers) and back using .encode() and .decode() functions following `TokenizerInterface` protocol. If you don't specify one, it will use the default Tiktoken tokenizer. An injected tokenizer must be safe to call concurrently from multiple threads and must survive `copy.deepcopy` — see [Injecting a custom tokenizer](#injecting-a-custom-tokenizer). | `TiktokenTokenizer` |
 | **tiktoken_model_name** | `str` | If you're using the default Tiktoken tokenizer, this is the name of the specific Tiktoken model to use. This setting is ignored if you provide your own tokenizer. | `gpt-4o-mini` |
 | **entity_extract_max_gleaning** | `int` | Number of loops in the entity extraction process, appending history messages | `1` |
 | **node_embedding_algorithm** | `str` | Algorithm for node embedding (currently not used) | `node2vec` |
@@ -84,7 +85,7 @@ Notes:
 | **embedding_batch_num** | `int` | Maximum batch size for embedding processes (multiple texts sent per batch) | `32` |
 | **embedding_func_max_async** | `int` | Maximum number of concurrent asynchronous embedding processes | `16` |
 | **llm_model_func** | `callable` | Function for LLM generation | `gpt_4o_mini_complete` |
-| **llm_model_name** | `str` | LLM model name for generation | `meta-llama/Llama-3.2-1B-Instruct` |
+| **llm_model_name** | `str` | LLM model name for generation | `gpt-4o-mini` |
 | **summary_context_size** | `int` | Maximum tokens send to LLM to generate summaries for entity relation merging | `10000`（configured by env var SUMMARY_CONTEXT_SIZE) |
 | **summary_max_tokens** | `int` | Maximum token size for entity/relation description | `500`（configured by env var SUMMARY_MAX_TOKENS) |
 | **llm_model_max_async** | `int` | Maximum number of concurrent asynchronous LLM processes | `4`（default value changed by env var MAX_ASYNC_LLM; MAX_ASYNC is still accepted as a deprecated alias) |
@@ -107,7 +108,7 @@ Notes:
 | `language` | Non-empty string. Defaults to `SUMMARY_LANGUAGE`, then `English`. | Output language used in entity and relationship extraction, entity/relation summaries, keyword extraction, and multimodal analysis prompts. |
 | `entity_type_prompt_file` | `.yml` or `.yaml` file name only. Loaded from `${PROMPT_DIR:-./prompts}/entity_type`. | Loads an entity extraction prompt profile. The profile can define `entity_types_guidance`, `entity_extraction_examples`, and `entity_extraction_json_examples`. The active extraction mode must have matching examples: text mode needs `entity_extraction_examples`; JSON mode needs `entity_extraction_json_examples`. |
 | `entity_types_guidance` | Non-empty string. | Inline entity type guidance injected into extraction prompts. This overrides both the prompt profile file and the built-in default guidance. |
-| `chunker` | Dict with F/R/V/P chunking settings. | Runtime baseline for chunker parameters. Each document gets a slim `chunk_options` snapshot at enqueue time; later edits affect only future enqueues. |
+| `chunker` | Dict with F/R/V/P chunking settings (the `C` selector reuses the `fixed_token` sub-dictionary). | Runtime baseline for chunker parameters. Each document gets a slim `chunk_options` snapshot at enqueue time; later edits affect only future enqueues. |
 
 Compact `chunker` shape:
 
@@ -130,6 +131,8 @@ Compact `chunker` shape:
     "breakpoint_threshold_type": "percentile",
     "breakpoint_threshold_amount": null,
     "buffer_size": 1,
+    // env/SDK only (CHUNK_V_SENTENCE_SPLIT_REGEX); the REST chunking.params
+    // object rejects this key with 422 — see GHSA-32jh-39m7-8x84 (ReDoS)
     "sentence_split_regex": "(?<=[.?!])\\s+|(?<=[。？！])"
   },
   "paragraph_semantic": {
@@ -217,6 +220,8 @@ rag.addon_params["chunker"]["recursive_character"]["separators"] = [
 
 Nested `chunker` edits are read when future documents are enqueued. Documents already enqueued keep their persisted `chunk_options` snapshot.
 
+`semantic_vector.sentence_split_regex` is the one exception: it is re-read from `addon_params` (seeded by `CHUNK_V_SENTENCE_SPLIT_REGEX`) on **every** processing run, and any value inside a persisted `chunk_options` snapshot is discarded and logged at WARNING. This also applies to an explicit `chunk_options=` passed to `apipeline_enqueue_documents` — a per-document splitter pattern is not supported. The pattern is applied by `re.split` to the document body while CPython holds the GIL, so an untrusted one can freeze the whole worker process; see [GHSA-32jh-39m7-8x84](https://github.com/HKUDS/LightRAG/security/advisories/GHSA-32jh-39m7-8x84).
+
 ### Notes and Precedence
 
 - Entity type guidance precedence is: `addon_params["entity_types_guidance"]` > `entity_type_prompt_file` profile > built-in default guidance.
@@ -234,7 +239,7 @@ Use `QueryParam` to control the behavior of your query:
 class QueryParam:
     """Configuration parameters for query execution in LightRAG."""
 
-    mode: Literal["local", "global", "hybrid", "naive", "mix", "bypass"] = "global"
+    mode: Literal["local", "global", "hybrid", "naive", "mix", "bypass"] = "mix"
     """Specifies the retrieval mode:
     - "local": Focuses on context-dependent information.
     - "global": Utilizes global knowledge.
@@ -467,9 +472,9 @@ async def initialize_rag():
 
 **Further reading:**
 - [LlamaIndex Documentation](https://developers.llamaindex.ai/python/framework/)
-- [Direct OpenAI Example](examples/unofficial-sample/lightrag_llamaindex_direct_demo.py)
-- [LiteLLM Proxy Example](examples/unofficial-sample/lightrag_llamaindex_litellm_demo.py)
-- [LiteLLM Proxy with Opik Example](examples/unofficial-sample/lightrag_llamaindex_litellm_opik_demo.py)
+- [Direct OpenAI Example](../examples/unofficial-sample/lightrag_llamaindex_direct_demo.py)
+- [LiteLLM Proxy Example](../examples/unofficial-sample/lightrag_llamaindex_litellm_demo.py)
+- [LiteLLM Proxy with Opik Example](../examples/unofficial-sample/lightrag_llamaindex_litellm_opik_demo.py)
 
 #### Using Azure OpenAI Models
 
@@ -564,6 +569,45 @@ To enhance retrieval quality, documents can be re-ranked based on a more effecti
 
 Inject one of these functions into the `rerank_model_func` attribute of the LightRAG object. For detailed usage, refer to `examples/rerank_example.py`.
 
+### Injecting a Custom Tokenizer
+
+Any object with `encode(str) -> list[int]` and `decode(list[int]) -> str` can be
+wrapped in `Tokenizer` and passed as `tokenizer=`. Two requirements apply:
+
+1. **It must be safe to call concurrently from multiple threads.** Token counting
+   is CPU-bound, so LightRAG runs it in worker threads to keep the asyncio event
+   loop responsive; several of them may enter your `encode`/`decode` at once.
+   LightRAG deliberately does not serialize calls on your behalf — a lock owned
+   by LightRAG would end up being waited on by the event loop behind a worker
+   thread, which is exactly the stall the threading is there to avoid.
+2. **It must survive `copy.deepcopy`.** `LightRAG` is a dataclass and builds its
+   internal config with `dataclasses.asdict`, which deep-copies non-dataclass
+   fields.
+
+The two interact: if you achieve thread safety with an internal `threading.Lock`,
+deep-copying it raises `TypeError: cannot pickle '_thread.lock' object`. Declare
+`__deepcopy__` returning `self`, which is sound precisely because a thread-safe
+tokenizer is safe to share:
+
+```python
+class MyTokenizer:
+    def __init__(self):
+        self._lock = threading.Lock()
+
+    def __deepcopy__(self, memo):
+        return self  # thread-safe, therefore shareable
+
+    def encode(self, content: str) -> list[int]: ...
+    def decode(self, tokens: list[int]) -> str: ...
+
+rag = LightRAG(..., tokenizer=Tokenizer("my-model", MyTokenizer()))
+```
+
+The built-in `TiktokenTokenizer` satisfies both. Note that copying it is not a
+way to get isolation: `tiktoken` caches encodings in a process-wide registry, so
+every `TiktokenTokenizer` for a given model — copies included — resolves to the
+same underlying BPE engine.
+
 ### User Prompt vs. Query
 
 When using LightRAG for content queries, avoid combining the search process with unrelated output processing, as this significantly impacts query effectiveness. The `user_prompt` parameter in `QueryParam` does not participate in the RAG retrieval phase — it guides the LLM on how to process the retrieved results after the query is completed.
@@ -611,14 +655,22 @@ OpenSearchKVStorage  OpenSearch
 NetworkXStorage          NetworkX (default)
 Neo4JStorage             Neo4J
 PGGraphStorage           PostgreSQL with AGE plugin
+PGTableGraphStorage      PostgreSQL, plain tables (no AGE, no extensions)
 MemgraphStorage          Memgraph
 OpenSearchGraphStorage   OpenSearch
 ```
 
 > Testing has shown that Neo4J delivers superior performance in production environments compared to PostgreSQL with AGE plugin.
+>
+> `PGTableGraphStorage` implements the graph layer on ordinary indexed tables plus
+> JSONB, so it runs on any stock PostgreSQL 14+ — including managed instances
+> (RDS, Cloud SQL, Supabase, Neon) where the AGE extension cannot be installed.
+> It shares the same `POSTGRES_*` configuration and connection pool as the other
+> PG storages. Choose `PGGraphStorage` only if you specifically need AGE/Cypher.
 
 **VECTOR_STORAGE**
 ```
+NoopVectorDBStorage         Disabled (graph-only ingestion)
 NanoVectorDBStorage         NanoVector (default)
 PGVectorStorage             Postgres
 MilvusVectorDBStorage       Milvus
@@ -627,6 +679,79 @@ QdrantVectorDBStorage       Qdrant
 MongoVectorDBStorage        MongoDB
 OpenSearchVectorDBStorage   OpenSearch
 ```
+
+#### Graph-only ingestion
+
+`NoopVectorDBStorage` is intended for an initial or offline corpus backfill
+where the graph and KV stores are authoritative and vector indexes can be
+materialized once from the final state. It avoids embedding and persisting
+intermediate entity, relationship, and chunk revisions during ingestion.
+
+Do not use this workflow when newly inserted documents must become queryable
+immediately. Normal incremental ingestion should use the intended persistent
+vector backend from the beginning.
+
+Configure the backfill process with the no-op backend. `embedding_func=None` is
+supported when no other configured component requires embeddings:
+
+```python
+rag = LightRAG(
+    working_dir=WORKING_DIR,
+    llm_model_func=llm_model_func,
+    embedding_func=None,
+    vector_storage="NoopVectorDBStorage",
+)
+```
+
+The backend accepts vector mutations without calling the embedding function or
+persisting vectors. Graph, full-document, text-chunk, LLM-cache, document-status,
+and graph-recovery writes continue normally.
+
+While `NoopVectorDBStorage` is active, only `bypass` queries are available.
+`local`, `global`, `hybrid`, `mix`, and `naive` modes require vector indexes and
+raise an error that points to `lightrag-rebuild-vdb`.
+
+If the semantic-vector (`V`) chunker is selected while `embedding_func=None`,
+it logs a warning and falls back to recursive-character chunking. Configure an
+embedding function during ingestion if semantic-vector chunk boundaries are
+required; this is separate from whether vectors are persisted.
+
+##### Switching to persistent vectors
+
+After the backfill, stop the server and all ingestion writers. Keep
+`WORKING_DIR`, `WORKSPACE`, graph storage, KV storage, and their connection
+settings unchanged. For example, switch from Noop to NanoVector with an OpenAI
+embedding model while pointing to the same graph and KV sources:
+
+```bash
+export WORKING_DIR=/data/lightrag/rag_storage
+export WORKSPACE=project_a
+export LIGHTRAG_GRAPH_STORAGE=NetworkXStorage
+export LIGHTRAG_KV_STORAGE=JsonKVStorage
+export LIGHTRAG_VECTOR_STORAGE=NanoVectorDBStorage
+export EMBEDDING_BINDING=openai
+export EMBEDDING_MODEL=text-embedding-3-small
+export EMBEDDING_DIM=1536
+
+lightrag-rebuild-vdb  # Select "Rebuild ALL vector storages"
+```
+
+Replace all example values with the backfill's actual storage settings and the
+production embedding model, dimension, host, and credentials. Backend-specific
+connection variables must remain available. If the same `.env` already contains
+these values, only the vector and embedding entries need to change. Run this in
+a new process or after a restart, then keep the persistent configuration for
+later queries and incremental ingestion.
+
+Rebuild cost and memory grow with the final graph and chunk data. If rebuilding
+fails or is interrupted, keep writers stopped and rerun it with the same
+configuration; the graph and KV sources remain unchanged. Start the server only
+after the tool reports a successful rebuild, for example with
+`lightrag-server`, because LightRAG has no persisted vector-index readiness
+marker.
+
+See `lightrag/tools/README_REBUILD_VDB.md` for rebuild options and operational
+details.
 
 **DOC_STATUS_STORAGE**
 ```
@@ -670,10 +795,11 @@ See `test_neo4j.py` for a working example.
 
 #### Using PostgreSQL Storage
 
-PostgreSQL can provide a one-stop solution as KV store, VectorDB (pgvector), and GraphDB (apache AGE). PostgreSQL version 16.6 or higher is supported.
+PostgreSQL can provide a one-stop solution as KV store, VectorDB (pgvector), and GraphDB (`PGTableGraphStorage` on plain indexed tables, or `PGGraphStorage` on Apache AGE). PostgreSQL version 16.6 or higher is supported.
 
 - PostgreSQL is lightweight; the whole binary distribution including all necessary plugins can be zipped to 40MB: Ref to [Windows Release](https://github.com/ShanGor/apache-age-windows/releases/tag/PG17%2Fv1.5.0-rc0) as it is easy to install for Linux/Mac.
-- If you prefer Docker, start with this image to avoid hiccups: https://hub.docker.com/r/gzdaniel/postgres-for-rag. The latest image no longer ships hardcoded credentials; on first start it creates the user, password, and database from the `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` environment variables (these are set automatically when you deploy via the `scripts/setup/setup.sh` wizard, so you can pick any values).
+- If you prefer Docker and graph storage is `PGTableGraphStorage` (the recommended choice, which needs no Apache AGE), the official pgvector image `pgvector/pgvector:pg18` is all you need.
+- Only `PGGraphStorage` requires an AGE-bundled image; to avoid hiccups there, start with https://hub.docker.com/r/gzdaniel/postgres-for-rag (published for `linux/amd64` and `linux/arm64`). The latest image no longer ships hardcoded credentials; on first start it creates the user, password, and database from the `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` environment variables (these are set automatically when you deploy via the `scripts/setup/setup.sh` wizard, so you can pick any values).
 - How to start: see [examples/lightrag_gemini_postgres_demo.py](https://github.com/HKUDS/LightRAG/blob/main/examples/lightrag_gemini_postgres_demo.py)
 - For high-performance graph database requirements, Neo4j is recommended as Apache AGE's performance is not as competitive.
 
@@ -877,7 +1003,7 @@ The `workspace` parameter ensures data isolation between different LightRAG inst
 | `JsonKVStorage`, `JsonDocStatusStorage`, `NetworkXStorage`, `NanoVectorDBStorage`, `FaissVectorDBStorage` | Workspace subdirectories |
 | `RedisKVStorage`, `MilvusVectorDBStorage`, `MongoKVStorage`, `MongoVectorDBStorage`, `MongoGraphStorage`, `PGGraphStorage` | Workspace prefix on collection name |
 | `QdrantVectorDBStorage` | Payload-based partitioning (Qdrant multitenancy) |
-| `PGKVStorage`, `PGVectorStorage`, `PGDocStatusStorage` | `workspace` field in tables |
+| `PGKVStorage`, `PGVectorStorage`, `PGDocStatusStorage`, `PGTableGraphStorage` | `workspace` field in tables |
 | `Neo4JStorage` | Labels |
 | `OpenSearch*` | Index name prefixes |
 
@@ -885,7 +1011,7 @@ The `workspace` parameter ensures data isolation between different LightRAG inst
 
 Storage-specific workspace environment variables override the common `WORKSPACE` variable: `REDIS_WORKSPACE`, `MILVUS_WORKSPACE`, `QDRANT_WORKSPACE`, `MONGODB_WORKSPACE`, `POSTGRES_WORKSPACE`, `NEO4J_WORKSPACE`, `OPENSEARCH_WORKSPACE`.
 
-For a practical demonstration of managing multiple isolated knowledge bases, see [Workspace Demo](examples/lightrag_gemini_workspace_demo.py).
+For a practical demonstration of managing multiple isolated knowledge bases, see [Workspace Demo](../examples/lightrag_gemini_workspace_demo.py).
 
 
 ## Insert
@@ -982,7 +1108,8 @@ product = rag.create_entity("Gmail", {
 relation = rag.create_relation("Google", "Gmail", {
     "description": "Google develops and operates Gmail.",
     "keywords": "develops operates service",
-    "weight": 2.0
+    "source_id": "chunk-google-gmail",
+    "weight": 1.5
 })
 ```
 
@@ -1008,6 +1135,62 @@ updated_relation = rag.edit_relation("Google", "Google Mail", {
     "weight": 3.0
 })
 ```
+
+Entity names supplied to `create_entity` and new names supplied during
+`edit_entity` renames use the same normalization rules as extracted entity
+names. When editing an existing entity, LightRAG first preserves an exact
+legacy name match and otherwise falls back to the normalized name.
+`insert_custom_kg` applies the same rules to declared entity names and both
+endpoints of every relationship before writing any custom KG data.
+`merge_entities` resolves existing exact legacy source/target names first and
+otherwise uses normalized names. The target may be an existing entity or a
+new normalized name created by the merge.
+
+### Relation Weight Contract
+
+Relation `weight` has an evidence-count floor. Each distinct real ID in the
+`source_id` field contributes one unit of evidence, and a larger explicit
+weight is an optional importance boost:
+
+```text
+weight >= len(distinct real source IDs)
+```
+
+Multiple source IDs use the `<SEP>` separator. Empty values and the historical
+no-source placeholders `manual_creation` and `UNKNOWN` are not evidence. When
+a relation has no real source IDs, its evidence count is zero, so a
+non-negative fractional weight is valid. When creating a source-less relation,
+omit `source_id`; when editing an existing relation, set `source_id` to an
+empty string in the same edit that lowers the weight.
+
+`create_relation`, `edit_relation`, and `insert_custom_kg` validate this
+contract before writing graph or vector data; invalid Python API inputs raise
+`ValueError` and the REST graph API returns HTTP 400. Relation edits validate
+the complete post-edit shape, so `source_id` and `weight` can be changed
+together. Existing legacy relations are repaired upward when extraction adds
+evidence, an entity rename rewrites their endpoints, an unrelated relation edit
+rewrites the row, or a relation is rebuilt from surviving chunks (document
+purge, resume, and custom-chunk rollback). `lightrag-rebuild-vdb` is not such a
+repair point: it mirrors each graph edge into the vector storage field for
+field, copying the stored weight verbatim without touching the graph.
+
+A rebuild re-derives the relation from the extraction results cached for the
+surviving chunks, so — like the rebuilt description and keywords — the weight is
+recomputed rather than preserved: it becomes the summed fragment weights lifted
+to the surviving evidence count. Weight therefore follows evidence downward as a
+purge removes chunks, and an importance boost applied through `edit_relation`
+does not survive a rebuild that finds cached fragments. When no cached fragment
+survives, the rebuild keeps the stored weight.
+
+When entity merging redirects multiple relations onto the same endpoint, the
+result is:
+
+```text
+merged weight = max(all input weights, distinct merged real source IDs)
+```
+
+This preserves a larger manual boost while preventing the merged weight from
+falling below its evidence count.
 
 All operations are available in both synchronous and asynchronous versions. Async versions have the prefix "a" (e.g., `acreate_entity`, `aedit_relation`).
 
@@ -1195,7 +1378,8 @@ When merging entities:
 - Duplicate relationships are intelligently merged
 - Self-relationships (loops) are prevented
 - Source entities are removed after merging
-- Relationship weights and attributes are preserved
+- Relationship attributes are merged, and each resulting weight is the larger
+  of every input weight and the distinct merged real-source count
 
 
 ## Troubleshooting

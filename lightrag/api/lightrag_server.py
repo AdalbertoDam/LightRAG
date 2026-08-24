@@ -9,6 +9,7 @@ from fastapi.openapi.docs import (
     get_swagger_ui_html,
     get_swagger_ui_oauth2_redirect_html,
 )
+import asyncio
 import json
 import os
 import re
@@ -16,6 +17,8 @@ import logging
 import logging.config
 import sys
 import textwrap
+import time
+import uuid
 import uvicorn
 import pipmaster as pm
 from typing import Any
@@ -31,9 +34,13 @@ from lightrag.api.utils_api import (
     get_auth_status_dependency,
     display_splash_screen,
     check_env_file,
+    internal_server_error,
 )
+from lightrag.api.admission_middleware import AdmissionMiddleware
+from lightrag.api.body_limit_middleware import BodyLimitMiddleware, resolve_body_limits
 from .config import (
     global_args,
+    normalize_api_prefix,
     update_uvicorn_mode_config,
     get_default_host,
     resolve_asymmetric_embedding_opt_in,
@@ -53,6 +60,7 @@ from lightrag.api.routers.document_routes import (
     DocumentManager,
     create_document_routes,
 )
+from lightrag.parser.docx.smart_heading.nlp import SmartHeadingNLPError
 from lightrag.parser.plugins import load_third_party_parsers
 from lightrag.parser.routing import (
     parser_rules_from_env,
@@ -72,9 +80,13 @@ from lightrag.kg.shared_storage import (
     cleanup_keyed_lock,
     drain_reserved_background_tasks,
     finalize_share_data,
+    get_pipeline_ingress,
 )
+from lightrag import pipeline_metrics
+from lightrag.utils_pipeline import describe_doc_status_capabilities
 from fastapi.security import OAuth2PasswordRequestForm
 from lightrag.api.auth import auth_handler
+from lightrag.api.login_rate_limit import LoginRateLimiter
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
@@ -390,24 +402,6 @@ def _inject_swagger_theme(html: str, theme: str) -> str:
 WEBUI_PATH = "/webui"
 
 
-def _normalize_api_prefix(value: str | None) -> str:
-    """Canonicalize an API prefix before handing it to FastAPI's ``root_path``.
-
-    Strips surrounding whitespace, ensures a leading slash, drops a trailing
-    slash, and treats empty/"/" as "no prefix". Raw CLI/env input like
-    ``"site01"`` or ``"/site01/"`` would otherwise feed an invalid form to
-    FastAPI and to the WebUI prefix injection.
-    """
-    if value is None:
-        return ""
-    value = value.strip()
-    if not value or value == "/":
-        return ""
-    if not value.startswith("/"):
-        value = "/" + value
-    return value.rstrip("/")
-
-
 class _RootPathNormalizationMiddleware:
     """Make Mount sub-apps work when the reverse proxy strips the API prefix.
 
@@ -717,6 +711,60 @@ def create_optimized_embedding_function(
     except ImportError as e:
         logger.warning(f"Could not import provider function for {binding}: {e}")
 
+    # Fail-fast guard: require explicit EMBEDDING_DIM when a non-default
+    # embedding model is configured. Without this, the provider's decorator
+    # dimension silently applies regardless of the actual model selected,
+    # causing vector-store write failures at runtime.
+    # See: https://github.com/HKUDS/LightRAG/issues/3644
+    # Note: lollms is excluded because it ignores the model parameter entirely.
+    _BINDINGS_WITH_DIM_GUARD = frozenset(
+        ["ollama", "openai", "jina", "gemini", "bedrock", "voyageai"]
+    )
+    # `not args.embedding_dim` (rather than `is None`) keeps the guard aligned
+    # with the truthiness-based dimension resolution below: a 0 would otherwise
+    # pass the guard and then silently resolve to the provider default.
+    if (
+        binding in _BINDINGS_WITH_DIM_GUARD
+        and model
+        and not args.embedding_dim
+        and provider_func is not None
+    ):
+        default_model = getattr(provider_func, "model_name", None)
+        if default_model:
+            # The `:latest` suffix is an Ollama/OCI convention; stripping it
+            # is a no-op for other bindings but keeps one unified comparison.
+            configured_model = model.removesuffix(":latest")
+            normalized_default = default_model.removesuffix(":latest")
+            if configured_model != normalized_default:
+                raise ValueError(
+                    "EMBEDDING_DIM must be set when EMBEDDING_MODEL selects a "
+                    f"custom {binding} model ({model!r}); the provider default "
+                    f"dimension only applies to {default_model!r}"
+                )
+
+    # Azure OpenAI uses deployment names that never match a universal default,
+    # so any configured model requires an explicit EMBEDDING_DIM.
+    # AZURE_EMBEDDING_DEPLOYMENT wins over the configured model at runtime
+    # (see azure_openai_embed: `os.getenv("AZURE_EMBEDDING_DEPLOYMENT") or model`),
+    # so the error message must resolve it in the same order.
+    azure_effective_model = (
+        (os.environ.get("AZURE_EMBEDDING_DEPLOYMENT") or model)
+        if binding == "azure_openai"
+        else None
+    )
+    if (
+        binding == "azure_openai"
+        and azure_effective_model
+        and not args.embedding_dim
+        and provider_func is not None
+    ):
+        raise ValueError(
+            "EMBEDDING_DIM must be set when using Azure OpenAI with a "
+            f"configured deployment ({azure_effective_model!r}); Azure deployment "
+            f"names require an explicit dimension. Note: AZURE_EMBEDDING_DEPLOYMENT "
+            f"takes precedence over EMBEDDING_MODEL as the effective deployment name"
+        )
+
     # Step 2: Apply priority (user config > provider default)
     # For max_token_size: explicit env var > provider default > None
     final_max_token_size = args.embedding_token_limit or provider_max_token_size
@@ -778,6 +826,7 @@ def create_optimized_embedding_function(
                     "texts": texts,
                     "host": host,
                     "api_key": api_key,
+                    "embedding_dim": embedding_dim,
                     "options": ollama_options,
                 }
                 if provider_supports_asymmetric and asymmetric_opt_in:
@@ -1201,6 +1250,106 @@ def check_frontend_build():
         return (True, False)  # Assume assets exist and up-to-date on error
 
 
+def _build_capability_status(rag) -> dict:
+    """Strict-capability report, or ``{}`` when it cannot be determined.
+
+    /health is a liveness probe first: one unavailable diagnostic must never turn
+    it into a 500.
+    """
+    doc_status = getattr(rag, "doc_status", None)
+    if doc_status is None:
+        return {}
+    try:
+        return describe_doc_status_capabilities(doc_status)
+    except Exception as capability_error:  # pragma: no cover - defensive
+        logger.debug(f"Capability probe unavailable for /health: {capability_error}")
+        return {}
+
+
+def _build_scheduling_status(pipeline_snapshot: dict, ingress_counts: dict) -> dict:
+    """Curated scheduling/observability view for /health (LR2 Phase 6 items 2/4).
+
+    Answers the questions an operator actually has during a manual retry or a
+    scan: which phase the manual channel is in, which request holds the freeze
+    and since when, what the drain is still waiting for, and how full the sticky
+    channel is. The manual owner's ``owner_token`` is omitted on purpose — it
+    authorizes releasing a reservation, so publishing it would turn a status page
+    into a control surface.
+    """
+    owner = pipeline_snapshot.get("manual_owner") or {}
+    freeze_started = pipeline_snapshot.get("manual_freeze_started_at")
+    freeze_seconds = None
+    if isinstance(freeze_started, (int, float)) and freeze_started > 0:
+        # Wall clock, because the freeze may be held by another process; a
+        # negative value (clock stepped back) is reported as 0 rather than as a
+        # nonsensical duration.
+        freeze_seconds = max(0.0, round(time.time() - float(freeze_started), 3))
+    pending_enqueues = int(pipeline_snapshot.get("pending_enqueues", 0) or 0)
+    return {
+        "manual_phase": pipeline_snapshot.get("manual_phase") or "idle",
+        "manual_freeze_requested": bool(
+            pipeline_snapshot.get("manual_freeze_requested", False)
+        ),
+        "manual_resetting": bool(pipeline_snapshot.get("manual_resetting", False)),
+        "manual_freeze_seconds": freeze_seconds,
+        "manual_owner_request_id": (
+            owner.get("request_id") if isinstance(owner, dict) else None
+        ),
+        "manual_owner_pid": owner.get("pid") if isinstance(owner, dict) else None,
+        # What a DRAIN_TO_IDLE is still waiting for: reservations whose rows are
+        # not written yet, plus whether a processing run still holds busy.
+        "drain_pending_enqueues": pending_enqueues,
+        "drain_waiting_on_workers": bool(pipeline_snapshot.get("busy", False)),
+        "manual_retries_queued": ingress_counts.get("manual_retries"),
+        "manual_retries_capacity": ingress_counts.get("manual_retries_capacity"),
+        "document_notifications_queued": ingress_counts.get("documents"),
+        "document_notification_overflows": ingress_counts.get("document_overflows"),
+        "auto_rescan_pending": ingress_counts.get("auto_rescan_pending"),
+    }
+
+
+def _create_llm_model_kwargs(binding: str, args, llm_timeout: int) -> dict:
+    """
+    Create LLM model kwargs based on binding type.
+    Uses lazy import for binding-specific options.
+    """
+    if binding == "lollms":
+        return {
+            "timeout": llm_timeout,
+            # "options" is an Ollama-only payload; lollms_model_if_cache()
+            # never reads it. Pin it to an empty dict instead of deriving it
+            # from OllamaLLMOptions.options_dict(args), which only happens to
+            # return {} because its arguments are registered for the ollama
+            # binding alone.
+            "options": {},
+            "api_key": args.llm_binding_api_key,
+            # lollms_model_if_cache()'s parameter is named base_url, not
+            # host -- unlike ollama's AsyncClient(host=...). Passing "host"
+            # here would silently land in its **kwargs and never be read.
+            "base_url": args.llm_binding_host,
+        }
+    if binding == "ollama":
+        try:
+            from lightrag.llm.binding_options import OllamaLLMOptions
+
+            options = OllamaLLMOptions.options_dict(args)
+        except ImportError as e:
+            raise Exception(f"Failed to import {binding} options: {e}")
+        # Imported lazily (the module installs the ollama package on import)
+        # and only for the binding that actually forwards think= -- lollms
+        # never reaches the ollama client.
+        from lightrag.llm.ollama import ensure_think_supported
+
+        ensure_think_supported(options, context="the base LLM binding")
+        return {
+            "timeout": llm_timeout,
+            "options": options,
+            "api_key": args.llm_binding_api_key,
+            "host": args.llm_binding_host,
+        }
+    return {}
+
+
 def create_app(args):
     # Check frontend build first and get status
     webui_assets_exist, is_frontend_outdated = check_frontend_build()
@@ -1221,7 +1370,27 @@ def create_app(args):
     # smart_heading but the pinned spaCy models are missing — surfacing the
     # install step at startup instead of failing mid-pipeline. Runs in
     # create_app so both the uvicorn and gunicorn (preload) paths hit it.
-    validate_smart_heading_dependencies()
+    # Caught here (instead of letting it propagate as a raw traceback) so the
+    # missing-dependency message reads like the other boxed startup notices.
+    try:
+        validate_smart_heading_dependencies()
+    except SmartHeadingNLPError as exc:
+        # markup=False: ASCIIColors interprets "[...]" as rich markup tags and
+        # silently drops anything it doesn't recognize (e.g. "[api]").
+        ASCIIColors.red("\n" + "=" * 80, markup=False)
+        ASCIIColors.red("ERROR: smart_heading dependencies missing", markup=False)
+        ASCIIColors.red("=" * 80, markup=False)
+        ASCIIColors.red(exc.problem, markup=False)
+        ASCIIColors.red("\nInstall with:", markup=False)
+        ASCIIColors.cyan(
+            "    pip install lightrag-hku[api] && lightrag-download-cache --spacy-install",
+            markup=False,
+        )
+        ASCIIColors.red(
+            "(offline: see requirements-offline-smart-heading.txt)", markup=False
+        )
+        ASCIIColors.red("=" * 80 + "\n", markup=False)
+        sys.exit(1)
 
     # Create configuration cache (this will output configuration logs)
     config_cache = LLMConfigCache(args)
@@ -1287,6 +1456,26 @@ def create_app(args):
             # Data migration regardless of storage implementation
             await rag.check_and_migrate_data()
 
+            # Admission control needs a doc_status backend that can count
+            # strictly (LR2 §9.1). Probe once here so an unsupported backend
+            # fails at startup instead of turning every upload into a 503.
+            if getattr(rag, "max_pending_documents", 0) > 0:
+                from lightrag.utils_pipeline import count_active_documents
+
+                try:
+                    active_now = await count_active_documents(rag.doc_status)
+                except Exception as admission_probe_error:
+                    raise RuntimeError(
+                        "MAX_PENDING_DOCUMENTS is set but the configured "
+                        f"doc_status backend cannot count strictly: "
+                        f"{admission_probe_error}"
+                    ) from admission_probe_error
+                logger.info(
+                    f"Admission control enabled: capacity "
+                    f"{rag.max_pending_documents}, {active_now} document(s) "
+                    "currently active"
+                )
+
             ASCIIColors.green("\nServer is ready to accept connections! 🚀\n")
 
             # Check Tracing status and provision LLM-as-a-Judge evaluators if enabled
@@ -1327,6 +1516,13 @@ def create_app(args):
             if shutdown_cancel is not None:
                 raise shutdown_cancel
 
+    # Single switch for every interactive API documentation surface: /docs,
+    # /docs/oauth2-redirect, /redoc, /openapi.json and the /static/swagger-ui
+    # mount. All five must stay conditioned on this one flag (issue #3666,
+    # RFC #3671) — a route audit that special-cases only the APIRoutes would
+    # diverge from the real route table.
+    api_docs_enabled = bool(getattr(args, "enable_api_docs", True))
+
     base_description = (
         "Providing API for LightRAG core, Web UI and Ollama Model Emulation"
     )
@@ -1338,16 +1534,16 @@ def create_app(args):
 
     # The WebUI mount path is fixed at "/webui" — see
     # docs/MultiSiteDeployment.md for the rationale.
-    api_prefix = _normalize_api_prefix(getattr(args, "api_prefix", None))
+    api_prefix = normalize_api_prefix(getattr(args, "api_prefix", None))
     webui_path = WEBUI_PATH
 
     app_kwargs = {
         "title": "LightRAG Server API",
         "description": swagger_description,
         "version": __api_version__,
-        "openapi_url": "/openapi.json",
+        "openapi_url": "/openapi.json" if api_docs_enabled else None,
         "docs_url": None,  # custom endpoint for offline Swagger support
-        "redoc_url": "/redoc",
+        "redoc_url": "/redoc" if api_docs_enabled else None,
         "root_path": api_prefix if api_prefix else None,
         "lifespan": lifespan,
     }
@@ -1390,6 +1586,26 @@ def create_app(args):
             # For other endpoints, return the default FastAPI validation error
             return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
+    # Last-resort handler for any exception that escapes a route without being
+    # converted to an HTTPException. It guarantees raw exception text never
+    # reaches the client (CWE-209): the full detail and traceback are logged
+    # server-side under a correlation id, and the response body carries only a
+    # generic message plus that id. HTTPException (including the sanitized 500s
+    # raised via internal_server_error) is still handled by FastAPI's own
+    # handler and is intentionally not intercepted here.
+    @app.exception_handler(Exception)
+    async def unhandled_exception_handler(request: Request, exc: Exception):
+        error_id = uuid.uuid4().hex[:12]
+        logger.error(
+            f"Unhandled exception [error_id={error_id}] on "
+            f"{request.method} {request.url.path}",
+            exc_info=True,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Internal server error (error_id: {error_id})"},
+        )
+
     def get_cors_origins():
         """Get allowed origins from global_args.
 
@@ -1411,6 +1627,36 @@ def create_app(args):
     # docstring.
     if api_prefix:
         app.add_middleware(_RootPathNormalizationMiddleware)
+
+    # Pre-body admission control (LR2 §9.3). Installed only when there is a
+    # capacity to enforce; the ingestion routes keep their own reservation, so an
+    # absent middleware costs economy (the body is read before the refusal), not
+    # correctness. ``rag`` is built further down in this function, hence the lazy
+    # getter.
+    #
+    # Added BEFORE the CORS middleware on purpose: the most recently added
+    # middleware runs outermost, so CORS ends up wrapping this one and its 401 /
+    # 429 responses carry the CORS headers a browser needs to read the status
+    # (without them the WebUI would see an opaque network error instead of "at
+    # capacity"). It therefore also sees the un-normalized path, which is why it
+    # strips ``api_prefix`` itself.
+    if args.max_pending_documents > 0:
+        app.add_middleware(
+            AdmissionMiddleware,
+            rag_getter=lambda: rag,
+            api_key=api_key,
+            api_prefix=api_prefix,
+        )
+
+    # Raw request-body ceilings (GHSA-r8jh-295g-vv42). Added AFTER the admission
+    # middleware so it ends up outside it: an oversized body is then refused
+    # before it can take a capacity slot, and the reservation a mid-body 413
+    # would otherwise strand is released by admission's own finally block as the
+    # exception travels back out. Still added before CORS, for the same reason
+    # admission is — a browser has to be able to read the 413.
+    body_limits = resolve_body_limits(args)
+    if body_limits is not None:
+        app.add_middleware(BodyLimitMiddleware, api_prefix=api_prefix, **body_limits)
 
     # Add CORS middleware
     cors_origins = get_cors_origins()
@@ -1617,25 +1863,6 @@ def create_app(args):
         except ImportError as e:
             raise Exception(f"Failed to import {binding} LLM binding: {e}")
 
-    def create_llm_model_kwargs(binding: str, args, llm_timeout: int) -> dict:
-        """
-        Create LLM model kwargs based on binding type.
-        Uses lazy import for binding-specific options.
-        """
-        if binding in ["lollms", "ollama"]:
-            try:
-                from lightrag.llm.binding_options import OllamaLLMOptions
-
-                return {
-                    "host": args.llm_binding_host,
-                    "timeout": llm_timeout,
-                    "options": OllamaLLMOptions.options_dict(args),
-                    "api_key": args.llm_binding_api_key,
-                }
-            except ImportError as e:
-                raise Exception(f"Failed to import {binding} options: {e}")
-        return {}
-
     def resolve_role_llm_settings(
         role: str, override_meta: dict | None = None
     ) -> dict[str, Any]:
@@ -1708,6 +1935,17 @@ def create_app(args):
                 )
             else:
                 role_provider_options = {}
+
+        if role_binding == "ollama":
+            # Validated after the whole resolution above (including the
+            # override_meta short-circuit), so what is checked is exactly what
+            # the role will call with -- inherited global OLLAMA_LLM_THINK
+            # included. Every role is resolved once while create_app builds
+            # role_llm_configs, so an unsupported think= stops the server at
+            # startup rather than at the role's first call.
+            from lightrag.llm.ollama import ensure_think_supported
+
+            ensure_think_supported(role_provider_options, context=f"LLM role '{role}'")
 
         bedrock_aws_options = {}
         if role_binding == "bedrock":
@@ -1826,6 +2064,9 @@ def create_app(args):
                 ) -> str:
                     if history_messages is None:
                         history_messages = []
+                    # Server-configured timeout overrides any caller-passed value,
+                    # matching the OpenAI/Azure/Gemini role wrappers.
+                    kwargs["timeout"] = role_timeout
                     if role_provider_options:
                         kwargs = {**role_provider_options, **kwargs}
                     return await bedrock_complete_if_cache(
@@ -1953,6 +2194,9 @@ def create_app(args):
         # which drops them and emits deprecation warnings when booleans are set.
         if config_cache.bedrock_llm_options:
             kwargs = {**config_cache.bedrock_llm_options, **kwargs}
+        # Server-configured timeout overrides any caller-passed value, matching
+        # the OpenAI wrapper (create_optimized_openai_llm_func).
+        kwargs["timeout"] = llm_timeout
 
         return await bedrock_complete_if_cache(
             args.llm_model,
@@ -1975,7 +2219,13 @@ def create_app(args):
     # Configure rerank function based on args.rerank_bindingparameter
     rerank_model_func = None
     if args.rerank_binding != "null":
-        from lightrag.rerank import cohere_rerank, jina_rerank, ali_rerank
+        from lightrag.rerank import (
+            cohere_rerank,
+            jina_rerank,
+            ali_rerank,
+            DEFAULT_RERANK_MAX_TOKENS_PER_DOC,
+            MIN_PRACTICAL_RERANK_MAX_TOKENS,
+        )
 
         # Map rerank binding to corresponding function
         rerank_functions = {
@@ -2006,6 +2256,39 @@ def create_app(args):
                 if default_base_url != inspect.Parameter.empty:
                     args.rerank_binding_host = default_base_url
 
+        # Cohere binding supports optional document chunking (useful for models with
+        # token limits like ColBERT). Parse and validate its config ONCE at startup so a
+        # misconfigured RERANK_MAX_TOKENS_PER_DOC fails fast here instead of surfacing on
+        # the first user query, and so the value is not re-parsed on every rerank call.
+        rerank_enable_chunking = False
+        rerank_max_tokens_per_doc = DEFAULT_RERANK_MAX_TOKENS_PER_DOC
+        if args.rerank_binding == "cohere":
+            rerank_enable_chunking = (
+                os.getenv("RERANK_ENABLE_CHUNKING", "false").lower() == "true"
+            )
+            raw_max_tokens = os.getenv(
+                "RERANK_MAX_TOKENS_PER_DOC", str(DEFAULT_RERANK_MAX_TOKENS_PER_DOC)
+            )
+            try:
+                rerank_max_tokens_per_doc = int(raw_max_tokens)
+            except ValueError as e:
+                raise ValueError(
+                    f"RERANK_MAX_TOKENS_PER_DOC must be an integer, got {raw_max_tokens!r}"
+                ) from e
+            if rerank_max_tokens_per_doc < 1:
+                raise ValueError(
+                    f"RERANK_MAX_TOKENS_PER_DOC must be >= 1, got {rerank_max_tokens_per_doc}"
+                )
+            if (
+                rerank_enable_chunking
+                and rerank_max_tokens_per_doc < MIN_PRACTICAL_RERANK_MAX_TOKENS
+            ):
+                logger.warning(
+                    f"RERANK_MAX_TOKENS_PER_DOC={rerank_max_tokens_per_doc} is below the "
+                    f"practical minimum ({MIN_PRACTICAL_RERANK_MAX_TOKENS}); chunking will "
+                    f"split each document into many tiny, low-signal chunks."
+                )
+
         async def server_rerank_func(
             query: str, documents: list, top_n: int = None, extra_body: dict = None
         ):
@@ -2020,15 +2303,10 @@ def create_app(args):
                 "base_url": args.rerank_binding_host,
             }
 
-            # Add Cohere-specific parameters if using cohere binding
+            # Add Cohere-specific parameters if using cohere binding (validated at startup)
             if args.rerank_binding == "cohere":
-                # Enable chunking if configured (useful for models with token limits like ColBERT)
-                kwargs["enable_chunking"] = (
-                    os.getenv("RERANK_ENABLE_CHUNKING", "false").lower() == "true"
-                )
-                kwargs["max_tokens_per_doc"] = int(
-                    os.getenv("RERANK_MAX_TOKENS_PER_DOC", "4096")
-                )
+                kwargs["enable_chunking"] = rerank_enable_chunking
+                kwargs["max_tokens_per_doc"] = rerank_max_tokens_per_doc
 
             return await selected_rerank_func(**kwargs, extra_body=extra_body)
 
@@ -2074,7 +2352,10 @@ def create_app(args):
             summary_context_size=args.summary_context_size,
             chunk_token_size=int(args.chunk_size),
             chunk_overlap_token_size=int(args.chunk_overlap_size),
-            llm_model_kwargs=create_llm_model_kwargs(
+            embedding_chunk_overlap_token_size=int(
+                args.embedding_chunk_overlap_token_size
+            ),
+            llm_model_kwargs=_create_llm_model_kwargs(
                 args.llm_binding, args, llm_timeout
             ),
             embedding_func=embedding_func,
@@ -2094,6 +2375,9 @@ def create_app(args):
             rerank_model_max_async=args.rerank_max_async,
             default_rerank_timeout=args.rerank_timeout,
             max_parallel_insert=args.max_parallel_insert,
+            pipeline_scheduling_page_size=args.pipeline_scheduling_page_size,
+            pipeline_require_strict_storage_reads=args.pipeline_require_strict_storage_reads,
+            max_pending_documents=args.max_pending_documents,
             max_graph_nodes=args.max_graph_nodes,
             addon_params=addon_params,
             ollama_server_infos=ollama_server_infos,
@@ -2147,30 +2431,51 @@ def create_app(args):
     ollama_api = OllamaAPI(rag, top_k=args.top_k, api_key=api_key)
     app.include_router(ollama_api.router, prefix="/api")
 
-    # Custom Swagger UI endpoint for offline support
-    @app.get("/docs", include_in_schema=False)
-    async def custom_swagger_ui_html(request: Request):
-        """Custom Swagger UI HTML with local static files"""
-        root = request.scope.get("root_path", "").rstrip("/")
-        response = get_swagger_ui_html(
-            openapi_url=f"{root}{app.openapi_url}",
-            title=app.title + " - Swagger UI",
-            oauth2_redirect_url=f"{root}/docs/oauth2-redirect",
-            swagger_js_url=f"{root}/static/swagger-ui/swagger-ui-bundle.js",
-            swagger_css_url=f"{root}/static/swagger-ui/swagger-ui.css",
-            swagger_favicon_url=f"{root}/static/swagger-ui/favicon-32x32.png",
-            swagger_ui_parameters=app.swagger_ui_parameters,
-        )
-        html = response.body.decode("utf-8")
-        html = _inject_swagger_theme(
-            html, request.query_params.get("theme", "auto").lower()
-        )
-        return HTMLResponse(content=html)
+    if api_docs_enabled:
+        # Custom Swagger UI endpoint for offline support
+        @app.get("/docs", include_in_schema=False)
+        async def custom_swagger_ui_html(request: Request):
+            """Custom Swagger UI HTML with local static files"""
+            root = request.scope.get("root_path", "").rstrip("/")
+            response = get_swagger_ui_html(
+                openapi_url=f"{root}{app.openapi_url}",
+                title=app.title + " - Swagger UI",
+                oauth2_redirect_url=f"{root}/docs/oauth2-redirect",
+                swagger_js_url=f"{root}/static/swagger-ui/swagger-ui-bundle.js",
+                swagger_css_url=f"{root}/static/swagger-ui/swagger-ui.css",
+                swagger_favicon_url=f"{root}/static/swagger-ui/favicon-32x32.png",
+                swagger_ui_parameters=app.swagger_ui_parameters,
+            )
+            html = response.body.decode("utf-8")
+            html = _inject_swagger_theme(
+                html, request.query_params.get("theme", "auto").lower()
+            )
+            return HTMLResponse(content=html)
 
-    @app.get("/docs/oauth2-redirect", include_in_schema=False)
-    async def swagger_ui_redirect():
-        """OAuth2 redirect for Swagger UI"""
-        return get_swagger_ui_oauth2_redirect_html()
+        @app.get("/docs/oauth2-redirect", include_in_schema=False)
+        async def swagger_ui_redirect():
+            """OAuth2 redirect for Swagger UI"""
+            return get_swagger_ui_oauth2_redirect_html()
+
+    def service_info_response(request: Request) -> JSONResponse:
+        """Fixed JSON fallback when neither the WebUI nor /docs can be served.
+
+        HTTP 200 with a root_path-aware health_url, so multi-site deployments
+        behind LIGHTRAG_API_PREFIX get a correct absolute path (RFC #3671).
+        """
+        root = request.scope.get("root_path", "")
+        return JSONResponse(
+            {
+                "status": "healthy",
+                "service": "LightRAG Server",
+                "api_version": api_version_display,
+                "message": (
+                    "WebUI assets are not bundled and API docs are disabled "
+                    "(ENABLE_API_DOCS=false)."
+                ),
+                "health_url": f"{root}/health",
+            }
+        )
 
     @app.get("/")
     async def redirect_to_webui(request: Request):
@@ -2178,13 +2483,16 @@ def create_app(args):
 
         Prepend the ASGI root_path so that, behind a reverse proxy, the
         absolute redirect target keeps the configured prefix instead of
-        bypassing it.
+        bypassing it. With docs disabled and no WebUI there is no page to
+        redirect to, so answer with the JSON service info instead of a 404.
         """
         root = request.scope.get("root_path", "")
         if webui_assets_exist:
             return RedirectResponse(url=f"{root}{webui_path}/")
-        else:
+        elif api_docs_enabled:
             return RedirectResponse(url=f"{root}/docs")
+        else:
+            return service_info_response(request)
 
     @app.get("/auth-status")
     async def get_auth_status():
@@ -2216,8 +2524,18 @@ def create_app(args):
             "webui_description": webui_description,
         }
 
+    # Brute-force protection for /login (CWE-307): throttle failed attempts per
+    # client IP + username. Checked before the bcrypt verification, so a locked
+    # key is also rejected without paying the bcrypt cost.
+    # getattr defaults keep create_app working for callers that build args
+    # programmatically (e.g. tests, embedding) without these newer fields.
+    login_rate_limiter = LoginRateLimiter(
+        max_attempts=getattr(args, "login_max_failed_attempts", 5),
+        window_seconds=getattr(args, "login_lockout_window_seconds", 300.0),
+    )
+
     @app.post("/login")
-    async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    async def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
         if not auth_handler.accounts:
             # Authentication not configured, return guest token
             guest_token = auth_handler.create_token(
@@ -2234,8 +2552,49 @@ def create_app(args):
                 "webui_description": webui_description,
             }
         username = form_data.username
-        if not auth_handler.verify_password(username, form_data.password):
-            raise HTTPException(status_code=401, detail="Incorrect credentials")
+        # Rate-limit key is client IP + username. X-Forwarded-For is NOT trusted
+        # (spoofable); behind a reverse proxy all clients may share the proxy IP,
+        # so buckets are separated by username to avoid one attacker locking out
+        # unrelated accounts. request.client can be None for some transports.
+        client_ip = request.client.host if request.client else "unknown"
+        rate_limit_key = f"{client_ip}:{username}"
+
+        retry_after = login_rate_limiter.retry_after(rate_limit_key)
+        if retry_after is not None:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many failed login attempts. Please try again later.",
+                headers={"Retry-After": str(int(retry_after) + 1)},
+            )
+
+        # Reserve this attempt BEFORE the bcrypt await. verify runs on a worker
+        # thread, so without pre-reserving, many concurrent requests would all
+        # pass the check above before any resolved, bypassing the limit (TOCTOU).
+        # retry_after + reserve here are synchronous with no await between them,
+        # so the decision is consistent. The reservation is always released in
+        # the finally; only a confirmed wrong password becomes a real failure.
+        login_rate_limiter.reserve_attempt(rate_limit_key)
+        try:
+            # verify_password runs a CPU-bound bcrypt for every attempt (incl.
+            # unknown usernames, to equalize timing). Run it in a worker thread
+            # so a login flood cannot block the event loop and starve the whole
+            # API (unauthenticated DoS).
+            password_ok = await asyncio.to_thread(
+                auth_handler.verify_password, username, form_data.password
+            )
+            # Record the outcome BEFORE releasing the reservation, so the entry
+            # still carries the failure (release removes a now-idle entry).
+            if not password_ok:
+                # Confirmed failure -> count it (and emit the lockout alert only
+                # here, so a correct password on the Nth attempt never does).
+                login_rate_limiter.commit_failure(rate_limit_key)
+                raise HTTPException(status_code=401, detail="Incorrect credentials")
+            # Success clears the key's earlier failures.
+            login_rate_limiter.reset(rate_limit_key)
+        finally:
+            # Always drop the in-flight reservation (also frees the slot once the
+            # key is fully idle, e.g. after a successful login).
+            login_rate_limiter.release(rate_limit_key)
 
         # Regular user login
         user_token = auth_handler.create_token(
@@ -2270,6 +2629,7 @@ def create_app(args):
                         "example": {
                             "status": "healthy",
                             "webui_available": True,
+                            "api_docs_available": True,
                             "working_directory": "/path/to/working/dir",
                             "input_directory": "/path/to/input/dir",
                             "configuration": {
@@ -2327,14 +2687,16 @@ def create_app(args):
             pipeline_status = await get_namespace_data(
                 "pipeline_status", workspace=workspace
             )
-
-            pipeline_busy = bool(pipeline_status.get("busy", False))
-            pipeline_scanning = bool(pipeline_status.get("scanning", False))
+            # One DictProxy RPC in multi-worker mode; keep /health read-only and
+            # avoid one cross-process ``get`` per field.
+            pipeline_snapshot = pipeline_status.copy()
+            pipeline_busy = bool(pipeline_snapshot.get("busy", False))
+            pipeline_scanning = bool(pipeline_snapshot.get("scanning", False))
             pipeline_destructive_busy = bool(
-                pipeline_status.get("destructive_busy", False)
+                pipeline_snapshot.get("destructive_busy", False)
             )
             pipeline_pending_enqueues = int(
-                pipeline_status.get("pending_enqueues", 0) or 0
+                pipeline_snapshot.get("pending_enqueues", 0) or 0
             )
             pipeline_active = (
                 pipeline_busy
@@ -2342,6 +2704,17 @@ def create_app(args):
                 or pipeline_destructive_busy
                 or pipeline_pending_enqueues > 0
             )
+
+            # Ingress channel depths (bounded counters only — never the
+            # messages). Best-effort: a mailbox that is not bootstrapped yet must
+            # not turn a liveness probe into a 500.
+            ingress_counts: dict[str, Any] = {}
+            try:
+                ingress_counts = dict(
+                    (await get_pipeline_ingress(workspace)).counts() or {}
+                )
+            except Exception as ingress_error:
+                logger.debug(f"Ingress counts unavailable for /health: {ingress_error}")
 
             if not auth_configured:
                 auth_mode = "disabled"
@@ -2359,6 +2732,10 @@ def create_app(args):
                 "core_version": core_version,
                 "api_version": api_version_display,
                 "webui_available": webui_assets_exist,
+                # Whether /docs, /redoc and /openapi.json are served — same
+                # liveness tier as webui_available: the state is trivially
+                # probeable by requesting /docs, so it leaks nothing.
+                "api_docs_available": api_docs_enabled,
                 "webui_title": webui_title,
                 "webui_description": webui_description,
                 "pipeline_busy": pipeline_busy,
@@ -2437,6 +2814,20 @@ def create_app(args):
                     "pipeline_scanning": pipeline_scanning,
                     "pipeline_destructive_busy": pipeline_destructive_busy,
                     "pipeline_pending_enqueues": pipeline_pending_enqueues,
+                    # Curated scheduling view (LR2 Phase 6 items 2 & 4). The raw
+                    # manual_* fields stay hidden from /pipeline_status — they are
+                    # coordination internals — but an operator watching a freeze
+                    # needs to see WHICH request holds it, for how long, and what
+                    # the drain is still waiting for. The owner token is
+                    # deliberately omitted: it is a capability, not a status.
+                    "scheduling": _build_scheduling_status(
+                        pipeline_snapshot, ingress_counts
+                    ),
+                    "capabilities": _build_capability_status(rag),
+                    # Per-worker counters/durations for the paths the bounded
+                    # rework introduced (LR2 Phase 6 item 3); see
+                    # lightrag/pipeline_metrics.py for the boundary.
+                    "scheduling_metrics": pipeline_metrics.snapshot(),
                     "keyed_locks": keyed_lock_info,
                     "llm_queue_status": await rag.get_llm_queue_status(
                         include_base=True
@@ -2448,7 +2839,7 @@ def create_app(args):
             return status_data
         except Exception as e:
             logger.error(f"Error getting health status: {str(e)}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise internal_server_error(e)
 
     # Pre-render the runtime-config <script> once. The browser-visible URL
     # prefixes are NOT baked into the bundle anymore — index.html ships with
@@ -2544,7 +2935,7 @@ def create_app(args):
 
     # Mount Swagger UI static files for offline support
     swagger_static_dir = Path(__file__).parent / "static" / "swagger-ui"
-    if swagger_static_dir.exists():
+    if api_docs_enabled and swagger_static_dir.exists():
         app.mount(
             "/static/swagger-ui",
             StaticFiles(directory=swagger_static_dir),
@@ -2570,7 +2961,13 @@ def create_app(args):
         @app.get(webui_path)
         @app.get(f"{webui_path}/")
         async def webui_redirect_to_docs(request: Request):
-            """Redirect WebUI path to /docs when WebUI is not available."""
+            """Redirect WebUI path to /docs when WebUI is not available.
+
+            With docs disabled there is no page to redirect to, so answer
+            with the JSON service info instead of a 404.
+            """
+            if not api_docs_enabled:
+                return service_info_response(request)
             root = request.scope.get("root_path", "")
             return RedirectResponse(url=f"{root}/docs")
 

@@ -7,6 +7,8 @@ from uuid import uuid4
 
 import pytest
 
+from lightrag.chunker import chunking_by_token_size
+
 _original_argv = sys.argv[:]
 sys.argv = [sys.argv[0]]
 _document_routes = importlib.import_module("lightrag.api.routers.document_routes")
@@ -22,6 +24,11 @@ sys.argv = _original_argv
 
 DocStatus = _base.DocStatus
 DeletionResult = _base.DeletionResult
+DocProcessingStatus = _base.DocProcessingStatus
+DocSchedulingRecord = _base.DocSchedulingRecord
+SourceAbsent = _base.SourceAbsent
+SourceConflict = _base.SourceConflict
+SourceUnique = _base.SourceUnique
 FULL_DOCS_FORMAT_LIGHTRAG = _constants.FULL_DOCS_FORMAT_LIGHTRAG
 FULL_DOCS_FORMAT_PENDING_PARSE = _constants.FULL_DOCS_FORMAT_PENDING_PARSE
 PARSED_DIR_NAME = _constants.PARSED_DIR_NAME
@@ -44,7 +51,8 @@ async def _parse_via_registry(rag, engine, doc_id, file_path, content_data):
 
 
 pipeline_index_file = _document_routes.pipeline_index_file
-pipeline_index_files = _document_routes.pipeline_index_files
+pipeline_enqueue_scan_batch = _document_routes.pipeline_enqueue_scan_batch
+_ScanCandidate = _document_routes._ScanCandidate
 pipeline_index_texts = _document_routes.pipeline_index_texts
 pipeline_enqueue_file = _document_routes.pipeline_enqueue_file
 run_scanning_process = _document_routes.run_scanning_process
@@ -113,6 +121,7 @@ class _FakeRag:
         self.errors = []
         # _resolve_text_chunking reads addon_params; {} -> default chunker config.
         self.addon_params = {}
+        self.chunking_func = chunking_by_token_size
 
     async def apipeline_enqueue_documents(
         self,
@@ -160,6 +169,15 @@ class _DuplicateEnqueueRag(_FakeRag):
 
 
 class _ScanDocStatus:
+    """doc_status double implementing the typed source-resolution contract.
+
+    Rows are keyed by the string that doubles as their doc id; a canonical source
+    key matches a row when it equals that key's basename. Unless a fixture pins
+    ``metadata`` explicitly, a row is treated as scan/upload-origin — those always
+    record the physical basename that created them in ``metadata.source_file``,
+    which is what tells a resumed file apart from an alias (LR2 §8.3.E/F/G).
+    """
+
     def __init__(self, docs_by_path):
         self.docs_by_path = docs_by_path
         self.deleted_ids: list[str] = []
@@ -168,12 +186,68 @@ class _ScanDocStatus:
         return self.docs_by_path.get(file_path)
 
     async def get_doc_by_file_basename(self, basename):
-        from pathlib import Path as _Path
-
+        # Still the upload path's duplicate check (the SCAN moved to the typed
+        # resolver below); a single primary row per basename is all it models.
         for stored_path, doc in self.docs_by_path.items():
-            if _Path(stored_path).name == basename:
+            if Path(stored_path).name == basename:
                 return stored_path, doc
         return None
+
+    def _metadata(self, doc_id, row):
+        metadata = row.get("metadata")
+        if metadata is None:
+            return {"source_file": Path(doc_id).name}
+        return metadata
+
+    def _status(self, row):
+        status = row.get("status")
+        return status if isinstance(status, DocStatus) else DocStatus(status)
+
+    async def resolve_doc_source_strict(self, canonical_source_key):
+        candidates = [
+            (doc_id, row)
+            for doc_id, row in self.docs_by_path.items()
+            if Path(doc_id).name == canonical_source_key
+            and not (self._metadata(doc_id, row) or {}).get("is_duplicate")
+        ]
+        if not candidates:
+            return SourceAbsent()
+        if len(candidates) > 1:
+            return SourceConflict(
+                candidate_count=len(candidates),
+                sample_doc_ids=tuple(doc_id for doc_id, _ in candidates[:2]),
+            )
+        doc_id, row = candidates[0]
+        return SourceUnique(
+            doc_id=doc_id,
+            doc=DocSchedulingRecord(
+                id=doc_id,
+                status=self._status(row),
+                created_at=row.get("created_at", ""),
+                updated_at=row.get("updated_at", ""),
+                file_path=row.get("file_path") or Path(doc_id).name,
+                track_id=row.get("track_id"),
+                has_custom_chunk_journal=False,
+            ),
+        )
+
+    async def get_full_docs_by_ids(self, doc_ids, *, strict=False):
+        hydrated = {}
+        for doc_id in doc_ids:
+            row = self.docs_by_path.get(doc_id)
+            if row is None:
+                continue
+            hydrated[doc_id] = DocProcessingStatus(
+                content_summary=row.get("content_summary", ""),
+                content_length=row.get("content_length", 0),
+                file_path=row.get("file_path") or Path(doc_id).name,
+                status=self._status(row),
+                created_at=row.get("created_at", ""),
+                updated_at=row.get("updated_at", ""),
+                track_id=row.get("track_id"),
+                metadata=self._metadata(doc_id, row),
+            )
+        return hydrated
 
     async def delete(self, ids):
         for doc_id in ids:
@@ -184,16 +258,22 @@ class _ScanDocStatus:
 class _ScanFullDocs:
     """Minimal full_docs double for run_scanning_process.
 
-    The scan now consults ``full_docs.get_by_id`` to distinguish a
-    resumable FAILED row (content was stored, only a downstream step
-    failed) from an extraction-error stub recorded by
-    ``apipeline_enqueue_error_documents`` (no full_docs entry exists).
+    The scan distinguishes a resumable FAILED row (content was stored, only a
+    downstream step failed) from an extraction-error stub recorded by
+    ``apipeline_enqueue_error_documents`` (no full_docs entry) — and per LR2
+    §8.3.D only a STRICT point read may drive that destructive decision, so this
+    double declares the capability.
     """
+
+    supports_strict_point_reads = True
 
     def __init__(self, docs_by_id):
         self.docs_by_id = docs_by_id
 
     async def get_by_id(self, doc_id):
+        return self.docs_by_id.get(doc_id)
+
+    async def get_by_id_strict(self, doc_id):
         return self.docs_by_id.get(doc_id)
 
 
@@ -209,7 +289,12 @@ class _ScanRag:
             full_docs_by_id = {path: {"content": ""} for path in docs_by_path}
         self.full_docs = _ScanFullDocs(full_docs_by_id)
         self.process_calls = 0
-        self.workspace = "scan-test"
+        # A workspace per instance: a scan publishes a sticky manual retry
+        # request that only a REAL pipeline run ACKs, and the /scan reservation
+        # refuses while an earlier request is queued (LR2 §8.1). With a shared
+        # workspace one endpoint test would then refuse the next one.
+        self.workspace = f"scan-test-{uuid4().hex}"
+        self.reset_calls = []
         self.enqueued = []
         self.errors = []
 
@@ -242,21 +327,67 @@ class _ScanRag:
     async def apipeline_process_enqueue_documents(self):
         self.process_calls += 1
 
+    async def apipeline_reset_failed_for_scan(
+        self, request_id, *, scan_owner_token=None
+    ):
+        # LR2 §8.1: the real pipeline drains to idle and resets FAILED→PENDING
+        # here, BEFORE discovery. The mock records the call and reports the
+        # reset complete so classification proceeds.
+        self.reset_calls.append((request_id, scan_owner_token))
+        return True
+
 
 class _DuplicateUploadRag:
-    def __init__(self, docs_by_path):
+    def __init__(self, docs_by_path, chunking_func=chunking_by_token_size):
         self.doc_status = _ScanDocStatus(docs_by_path)
         self.workspace = f"upload-test-{uuid4().hex}"
+        self.chunking_func = chunking_func
+        self.addon_params = {}
+
+
+class _DeleteDocStatus:
+    def __init__(self, rows: dict | None = None):
+        self.rows = rows or {}
+
+    def _primary_matches(self, basename: str) -> list[tuple[str, dict]]:
+        return [
+            (doc_id, row)
+            for doc_id, row in self.rows.items()
+            if row.get("file_path") == basename
+            and not (row.get("metadata") or {}).get("is_duplicate")
+        ]
+
+    async def get_doc_by_file_basename(self, basename: str):
+        # Legacy best-effort lookup; real backends expose both methods. The
+        # route's ownership check must NOT use this one (mongo/redis/opensearch
+        # swallow query failures into None), which the fail-closed regression
+        # test below pins behaviorally.
+        matches = self._primary_matches(basename)
+        return matches[0] if matches else None
+
+    async def resolve_doc_source_strict(self, canonical_source_key: str):
+        matches = self._primary_matches(canonical_source_key)
+        if not matches:
+            return SourceAbsent()
+        if len(matches) == 1:
+            doc_id, row = matches[0]
+            return SourceUnique(doc_id=doc_id, doc=row)
+        return SourceConflict(
+            candidate_count=len(matches),
+            sample_doc_ids=tuple(doc_id for doc_id, _ in matches[:2]),
+        )
 
 
 class _DeleteRag:
-    def __init__(self, result):
+    def __init__(self, result, status_rows=None):
         self.result = result
         self.workspace = f"delete-test-{uuid4().hex}"
         self.deleted_doc_ids = []
+        self.doc_status = _DeleteDocStatus(status_rows)
 
     async def adelete_by_doc_id(self, doc_id, delete_llm_cache=False):
         self.deleted_doc_ids.append((doc_id, delete_llm_cache))
+        self.doc_status.rows.pop(doc_id, None)
         return self.result
 
     async def apipeline_process_enqueue_documents(self):
@@ -289,15 +420,18 @@ class _ParseFullDocs:
 class _ParseDocStatus:
     """Minimal doc_status double for the parse_* archive tests.
 
-    ``_persist_parsed_full_docs`` reads the existing record and patches its
-    ``content_hash``; with no record present the helper short-circuits, which
-    is what these tests want — they only assert on full_docs side effects.
+    ``_persist_parsed_full_docs`` patches the row's ``content_hash`` through the
+    targeted-field update; ``missing_ok`` makes a missing row a no-op, which is
+    what these tests want — they only assert on full_docs side effects.
     """
 
     async def get_by_id(self, doc_id):
         return None
 
     async def upsert(self, data):
+        return None
+
+    async def update_doc_status_fields(self, doc_id, fields, *, missing_ok=False):
         return None
 
 
@@ -509,6 +643,26 @@ async def test_pipeline_enqueue_passes_process_options_from_filename_hint(
     assert file_path.exists()
 
 
+async def test_scan_enqueue_accepts_c_hint_for_observable_runtime_fallback(
+    tmp_path, monkeypatch
+):
+    """Scan has no caller to receive a 422, so ``C`` remains persisted and the
+    runtime decides between the injected callback and warned F fallback."""
+    monkeypatch.setenv("LIGHTRAG_PARSER", "docx:native")
+    file_path = tmp_path / "report.[native-Cite].docx"
+    file_path.write_bytes(b"docx-bytes")
+    rag = _FakeRag()
+
+    enqueued = await pipeline_enqueue_scan_batch(
+        rag,
+        [_ScanCandidate(file_path, len(b"docx-bytes"))],
+        "track-custom-scan",
+    )
+
+    assert enqueued == 1
+    assert rag.enqueued[0]["process_options"] == "Cite"
+
+
 async def test_pipeline_enqueue_rejects_invalid_filename_hint(tmp_path, monkeypatch):
     """Bad filename processing hints must become file-processing errors."""
     monkeypatch.setenv("LIGHTRAG_PARSER", "docx:native")
@@ -552,7 +706,7 @@ async def test_pipeline_enqueue_lightrag_parser_rule_provides_default_options(
     assert enqueued["process_options"] == "iet"
 
 
-async def test_pipeline_index_files_leaves_lightrag_document_docx_batch(
+async def test_pipeline_enqueue_scan_batch_leaves_lightrag_document_docx_batch(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv("LIGHTRAG_PARSER", "docx:native")
@@ -562,7 +716,16 @@ async def test_pipeline_index_files_leaves_lightrag_document_docx_batch(
     second.write_bytes(b"second docx bytes")
     rag = _FakeRag()
 
-    await pipeline_index_files(rag, [second, first], "track-scan")
+    await pipeline_enqueue_scan_batch(
+        rag,
+        [_ScanCandidate(second, 0), _ScanCandidate(first, 0)],
+        "track-scan",
+    )
+
+    # ``second.[mineru].docx`` needs MINERU_LOCAL_ENDPOINT, so only first.docx
+    # actually enqueues here. Assert that explicitly: an empty ``rag.enqueued``
+    # would satisfy every ``all(...)`` below and the test would prove nothing.
+    assert [item["file_path"] for item in rag.enqueued] == [str(first)]
 
     assert first.exists()
     assert second.exists()
@@ -575,6 +738,90 @@ async def test_pipeline_index_files_leaves_lightrag_document_docx_batch(
     assert all(
         item["process_options"] == PROCESS_OPTION_CHUNK_FIXED for item in rag.enqueued
     )
+
+
+async def test_pipeline_enqueue_scan_batch_preserves_the_spool_order(
+    tmp_path, monkeypatch
+):
+    """Fix-proof: the batch is enqueued in the order the spool handed it over.
+
+    Global oldest-file-first ordering is recorded into doc_status one
+    ``created_at=now()`` row at a time, so this helper is the last place it can
+    be silently destroyed. It used to re-sort each batch with
+    ``sorted(..., key=get_pinyin_sort_key)``; with these two names that sort
+    reverses the batch, so re-introducing it fails here.
+    """
+    monkeypatch.setenv("LIGHTRAG_PARSER", "docx:native")
+    older = tmp_path / "zebra.docx"
+    newer = tmp_path / "alpha.docx"
+    older.write_bytes(b"older docx bytes")
+    newer.write_bytes(b"newer docx bytes")
+    rag = _FakeRag()
+
+    # Spool order (by mtime) deliberately opposes alphabetical/pinyin order.
+    enqueued = await pipeline_enqueue_scan_batch(
+        rag,
+        [_ScanCandidate(older, 0), _ScanCandidate(newer, 0)],
+        "track-scan",
+    )
+
+    assert enqueued == 2
+    assert [item["file_path"] for item in rag.enqueued] == [str(older), str(newer)]
+
+
+async def test_pipeline_enqueue_scan_batch_reuses_the_spooled_file_size(
+    tmp_path, monkeypatch
+):
+    """The size discovery stat'ed travels with the candidate — no second stat.
+
+    INPUT_DIR is frequently a network mount, so the enqueue phase must not pay
+    another metadata round-trip per file just to fill in an error-report field.
+    """
+    monkeypatch.setenv("LIGHTRAG_PARSER", "docx:native")
+    doc = tmp_path / "sized.docx"
+    doc.write_bytes(b"docx bytes")
+    rag = _FakeRag()
+
+    stats: list[Path] = []
+    real_stat = Path.stat
+
+    def _counting_stat(self, *args, **kwargs):
+        stats.append(self)
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", _counting_stat)
+
+    await pipeline_enqueue_scan_batch(rag, [_ScanCandidate(doc, 4096)], "track-scan")
+
+    assert len(rag.enqueued) == 1
+    assert doc not in stats
+
+
+async def test_pipeline_enqueue_file_stats_when_no_size_is_supplied(
+    tmp_path, monkeypatch
+):
+    """The non-scan ingress paths still get their size the ordinary way.
+
+    Counterpart to the test above: the stat is SKIPPED only because the caller
+    supplied the size, not because it was dropped for everyone.
+    """
+    doc = tmp_path / "unsized.docx"
+    doc.write_bytes(b"docx bytes")
+    rag = _FakeRag()
+
+    stats: list[Path] = []
+    real_stat = Path.stat
+
+    def _counting_stat(self, *args, **kwargs):
+        stats.append(self)
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", _counting_stat)
+
+    success, _track = await pipeline_enqueue_file(rag, doc, "track-upload")
+
+    assert success is True
+    assert doc in stats
 
 
 async def test_pipeline_index_texts_sets_api_default_process_options():
@@ -623,7 +870,9 @@ async def test_scan_processed_same_name_archives_with_unique_name(
     async def fail_if_reenqueue(*args, **kwargs):
         raise AssertionError("existing docx should not be re-enqueued")
 
-    monkeypatch.setattr(_document_routes, "pipeline_index_files", fail_if_reenqueue)
+    monkeypatch.setattr(
+        _document_routes, "pipeline_enqueue_scan_batch", fail_if_reenqueue
+    )
 
     await run_scanning_process(rag, doc_manager, "track-scan")
 
@@ -651,7 +900,9 @@ async def test_scan_processed_canonical_name_archives_hinted_file(
     async def fail_if_reenqueue(*args, **kwargs):
         raise AssertionError("canonical duplicate should not be re-enqueued")
 
-    monkeypatch.setattr(_document_routes, "pipeline_index_files", fail_if_reenqueue)
+    monkeypatch.setattr(
+        _document_routes, "pipeline_enqueue_scan_batch", fail_if_reenqueue
+    )
 
     await run_scanning_process(rag, doc_manager, "track-scan")
 
@@ -659,7 +910,7 @@ async def test_scan_processed_canonical_name_archives_hinted_file(
     assert (tmp_path / PARSED_DIR_NAME / file_path.name).read_bytes() == b"docx bytes"
 
 
-async def test_scan_archives_same_batch_canonical_duplicates(tmp_path, monkeypatch):
+async def test_scan_archives_scan_wide_canonical_duplicates(tmp_path, monkeypatch):
     plain_file = tmp_path / "same.docx"
     hinted_file = tmp_path / "same.[native].docx"
     plain_file.write_bytes(b"plain docx bytes")
@@ -668,34 +919,41 @@ async def test_scan_archives_same_batch_canonical_duplicates(tmp_path, monkeypat
     rag = _ScanRag({})
     calls = []
 
-    async def capture_pipeline(rag_arg, file_paths, track_id, **kwargs):
+    async def capture_pipeline(rag_arg, candidates, track_id, **kwargs):
         calls.append(
             {
                 "rag": rag_arg,
-                "file_paths": file_paths,
+                "file_paths": [candidate.path for candidate in candidates],
                 "track_id": track_id,
                 "kwargs": kwargs,
             }
         )
+        return len(candidates)
 
-    monkeypatch.setattr(_document_routes, "pipeline_index_files", capture_pipeline)
+    monkeypatch.setattr(
+        _document_routes, "pipeline_enqueue_scan_batch", capture_pipeline
+    )
 
     await run_scanning_process(rag, doc_manager, "track-scan")
 
-    # Hinted variant is preferred so the user's explicit engine choice wins;
-    # the plain variant is the one that gets archived.
+    # LR2 §8.4/§8.5: the winner is whichever physical file claimed the canonical
+    # key FIRST in the scan-wide disk spool. Discovery is a single unordered
+    # pass, so the previous "hinted variant always wins" preference is gone by
+    # design. Exactly one variant is enqueued and the other is ARCHIVED, never
+    # deleted; which one wins is not promised.
     assert len(calls) == 1
-    assert calls[0]["file_paths"] == [hinted_file]
-    # The scan-owned background task forwards from_scan=True so per-file
-    # enqueues bypass the scanning guard whose ``scanning`` flag the
-    # scan task itself holds.
-    assert calls[0]["kwargs"] == {"from_scan": True}
+    assert len(calls[0]["file_paths"]) == 1
+    winner = calls[0]["file_paths"][0]
+    loser = plain_file if winner == hinted_file else hinted_file
+    # from_scan is implied by pipeline_enqueue_scan_batch — the scan is its only
+    # caller — so the batch call carries no extra keyword.
+    assert calls[0]["kwargs"] == {}
     archived_names = {
         path.name for path in (tmp_path / PARSED_DIR_NAME).iterdir() if path.is_file()
     }
-    assert archived_names == {"same.docx"}
-    assert hinted_file.exists()
-    assert not plain_file.exists()
+    assert archived_names == {loser.name}
+    assert winner.exists()
+    assert not loser.exists()
 
 
 async def test_scan_rejects_invalid_filename_hint(tmp_path, monkeypatch):
@@ -716,7 +974,11 @@ async def test_scan_rejects_invalid_filename_hint(tmp_path, monkeypatch):
         "[File Extraction]Filename hint error"
     )
     assert "multiple chunking modes" in error_files[0]["original_error"]
-    assert rag.process_calls == 0
+    # LR2 §8.1: every scan ends with exactly ONE processing drive, even when no
+    # file was enqueued — resume targets and the FAILED rows the pre-discovery
+    # reset turned into PENDING have no other trigger (an empty queue makes it a
+    # cheap no-op).
+    assert rag.process_calls == 1
     assert file_path.exists()
 
 
@@ -735,17 +997,20 @@ async def test_scan_existing_non_processed_reprocesses_file(tmp_path, monkeypatc
     )
     calls = []
 
-    async def capture_pipeline(rag_arg, file_paths, track_id, **kwargs):
+    async def capture_pipeline(rag_arg, candidates, track_id, **kwargs):
         calls.append(
             {
                 "rag": rag_arg,
-                "file_paths": file_paths,
+                "file_paths": [candidate.path for candidate in candidates],
                 "track_id": track_id,
                 "kwargs": kwargs,
             }
         )
+        return len(candidates)
 
-    monkeypatch.setattr(_document_routes, "pipeline_index_files", capture_pipeline)
+    monkeypatch.setattr(
+        _document_routes, "pipeline_enqueue_scan_batch", capture_pipeline
+    )
 
     await run_scanning_process(rag, doc_manager, "track-scan")
 
@@ -790,17 +1055,20 @@ async def test_scan_mixed_new_and_resume_routes_only_new_through_enqueue(
     )
     calls = []
 
-    async def capture_pipeline(rag_arg, file_paths, track_id, **kwargs):
+    async def capture_pipeline(rag_arg, candidates, track_id, **kwargs):
         calls.append(
             {
                 "rag": rag_arg,
-                "file_paths": file_paths,
+                "file_paths": [candidate.path for candidate in candidates],
                 "track_id": track_id,
                 "kwargs": kwargs,
             }
         )
+        return len(candidates)
 
-    monkeypatch.setattr(_document_routes, "pipeline_index_files", capture_pipeline)
+    monkeypatch.setattr(
+        _document_routes, "pipeline_enqueue_scan_batch", capture_pipeline
+    )
 
     await run_scanning_process(rag, doc_manager, "track-scan")
 
@@ -809,7 +1077,9 @@ async def test_scan_mixed_new_and_resume_routes_only_new_through_enqueue(
     # source on disk.
     assert len(calls) == 1
     assert calls[0]["file_paths"] == [new_file]
-    assert calls[0]["kwargs"] == {"from_scan": True}
+    # from_scan is implied by pipeline_enqueue_scan_batch (the scan is its only
+    # caller), so the batch call carries no extra keyword.
+    assert calls[0]["kwargs"] == {}
     # The unconditional trigger fires once — guaranteeing the resume row
     # advances even if pipeline_index_files's internal trigger were to be
     # skipped (e.g. if every new file was rejected by enqueue).
@@ -844,17 +1114,20 @@ async def test_scan_failed_extraction_record_without_full_docs_is_retried(
     )
     calls = []
 
-    async def capture_pipeline(rag_arg, file_paths, track_id, **kwargs):
+    async def capture_pipeline(rag_arg, candidates, track_id, **kwargs):
         calls.append(
             {
                 "rag": rag_arg,
-                "file_paths": file_paths,
+                "file_paths": [candidate.path for candidate in candidates],
                 "track_id": track_id,
                 "kwargs": kwargs,
             }
         )
+        return len(candidates)
 
-    monkeypatch.setattr(_document_routes, "pipeline_index_files", capture_pipeline)
+    monkeypatch.setattr(
+        _document_routes, "pipeline_enqueue_scan_batch", capture_pipeline
+    )
 
     await run_scanning_process(rag, doc_manager, "track-scan")
 
@@ -864,8 +1137,11 @@ async def test_scan_failed_extraction_record_without_full_docs_is_retried(
     assert rag.doc_status.deleted_ids == [str(file_path)]
     assert len(calls) == 1
     assert calls[0]["file_paths"] == [file_path]
-    assert calls[0]["kwargs"] == {"from_scan": True}
-    assert rag.process_calls == 0
+    # from_scan is implied by pipeline_enqueue_scan_batch (the scan is its only
+    # caller), so the batch call carries no extra keyword.
+    assert calls[0]["kwargs"] == {}
+    # One drive per scan (LR2 §8.1); the batch itself never drives processing.
+    assert rag.process_calls == 1
     assert file_path.exists()
 
 
@@ -889,10 +1165,12 @@ async def test_scan_failed_with_full_docs_resumes_normally(tmp_path, monkeypatch
     )
     calls = []
 
-    async def capture_pipeline(rag_arg, file_paths, track_id, **kwargs):
-        calls.append(file_paths)
+    async def capture_pipeline(rag_arg, candidates, track_id, **kwargs):
+        calls.append([candidate.path for candidate in candidates])
 
-    monkeypatch.setattr(_document_routes, "pipeline_index_files", capture_pipeline)
+    monkeypatch.setattr(
+        _document_routes, "pipeline_enqueue_scan_batch", capture_pipeline
+    )
 
     await run_scanning_process(rag, doc_manager, "track-scan")
 
@@ -931,14 +1209,13 @@ async def test_scan_resume_runs_when_all_new_files_fail_to_enqueue(
         }
     )
 
-    async def index_files_all_rejected(rag_arg, file_paths, track_id, **kwargs):
-        # Real pipeline_index_files skips its internal
-        # apipeline_process_enqueue_documents call when no per-file enqueue
-        # succeeded; the mock omits the call entirely to mirror that.
-        return None
+    async def index_files_all_rejected(rag_arg, candidates, track_id, **kwargs):
+        # Mirror the real helper when every per-file enqueue is rejected: the
+        # batch lands nothing (0), and enqueue never drives processing anyway.
+        return 0
 
     monkeypatch.setattr(
-        _document_routes, "pipeline_index_files", index_files_all_rejected
+        _document_routes, "pipeline_enqueue_scan_batch", index_files_all_rejected
     )
 
     await run_scanning_process(rag, doc_manager, "track-scan")
@@ -1018,6 +1295,125 @@ async def test_upload_rejects_parser_hinted_filesystem_duplicate(tmp_path, monke
     assert not (tmp_path / "existing.[native].docx").exists()
 
 
+async def test_upload_opener_construction_failure_returns_500_not_409(
+    tmp_path, monkeypatch
+):
+    """upload_file_opener() raising means the input directory itself could
+    not be opened (permissions, removed mid-request, etc.) -- a server-side
+    fault, not a client-fixable name conflict. Before the fix this hit the
+    same try/except as the real O_EXCL conflict and returned a misleading
+    409; it must now propagate to the endpoint's internal_server_error(e)
+    500 path instead."""
+    monkeypatch.setattr(
+        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
+    )
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _DuplicateUploadRag({})
+    router = create_document_routes(rag, doc_manager)
+    upload_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "upload_to_input_dir"
+    ][-1]
+    upload_file = _document_routes.UploadFile(
+        filename="safe.pdf", file=BytesIO(b"content")
+    )
+
+    def _raise_oserror(_input_dir):
+        raise OSError("input directory unavailable")
+
+    monkeypatch.setattr(_document_routes, "upload_file_opener", _raise_oserror)
+
+    with pytest.raises(_document_routes.HTTPException) as excinfo:
+        await upload_endpoint(set(), upload_file)
+
+    assert excinfo.value.status_code == 500
+    assert "input directory unavailable" not in str(excinfo.value.detail)
+    assert not (tmp_path / "safe.pdf").exists()
+
+
+async def test_upload_open_time_permission_error_returns_500_not_409(
+    tmp_path, monkeypatch
+):
+    """A non-conflict OSError raised while the opener actually creates the
+    file (permission denied, ENOSPC, read-only filesystem, ...) is a
+    server-side fault, not the O_EXCL/O_NOFOLLOW name conflict the 409 branch
+    exists for -- only FileExistsError/ELOOP should map to 409."""
+    monkeypatch.setattr(
+        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
+    )
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _DuplicateUploadRag({})
+    router = create_document_routes(rag, doc_manager)
+    upload_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "upload_to_input_dir"
+    ][-1]
+    upload_file = _document_routes.UploadFile(
+        filename="safe.pdf", file=BytesIO(b"content")
+    )
+
+    def _permission_denied_opener(_input_dir):
+        def opener(path, flags):
+            raise PermissionError(13, "Permission denied")
+
+        return opener
+
+    monkeypatch.setattr(
+        _document_routes, "upload_file_opener", _permission_denied_opener
+    )
+
+    with pytest.raises(_document_routes.HTTPException) as excinfo:
+        await upload_endpoint(set(), upload_file)
+
+    assert excinfo.value.status_code == 500
+    assert "Permission denied" not in str(excinfo.value.detail)
+    assert not (tmp_path / "safe.pdf").exists()
+
+
+async def test_upload_write_failure_cleans_up_partial_file_and_returns_500(
+    tmp_path, monkeypatch
+):
+    """An OSError raised after the exclusive-create opener already succeeded
+    (e.g. ENOSPC mid-stream) is a server-side fault, not the O_EXCL/O_NOFOLLOW
+    conflict the 409 branch exists for. It must delete the partial file (so a
+    retry isn't permanently blocked by the exact-file precheck) and surface as
+    a 500 that doesn't echo the raw OSError text."""
+    monkeypatch.setattr(
+        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
+    )
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _DuplicateUploadRag({})
+    router = create_document_routes(rag, doc_manager)
+    upload_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "upload_to_input_dir"
+    ][-1]
+    upload_file = _document_routes.UploadFile(
+        filename="safe.pdf", file=BytesIO(b"content")
+    )
+
+    call_count = 0
+
+    async def _read_then_fail(_size):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return b"partial content"
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(upload_file, "read", _read_then_fail)
+
+    with pytest.raises(_document_routes.HTTPException) as excinfo:
+        await upload_endpoint(set(), upload_file)
+
+    assert excinfo.value.status_code == 500
+    assert "No space left on device" not in str(excinfo.value.detail)
+    assert not (tmp_path / "safe.pdf").exists()
+
+
 async def test_upload_rejects_malformed_hint_with_detail(tmp_path, monkeypatch):
     """A malformed filename hint fails the upload synchronously with the
     detailed hint error in the 400 body (it used to be accepted and only
@@ -1045,12 +1441,74 @@ async def test_upload_rejects_malformed_hint_with_detail(tmp_path, monkeypatch):
     assert "multiple chunking modes" in excinfo.value.detail
 
 
+async def test_upload_rejects_c_without_custom_callback_before_writing(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
+    )
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _DuplicateUploadRag({})
+    router = create_document_routes(rag, doc_manager)
+    upload_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "upload_to_input_dir"
+    ][-1]
+    upload_file = _document_routes.UploadFile(
+        filename="custom.[native-C].docx",
+        file=BytesIO(b"docx bytes"),
+    )
+
+    with pytest.raises(_document_routes.HTTPException) as excinfo:
+        await upload_endpoint(set(), upload_file)
+
+    assert excinfo.value.status_code == 422
+    assert "custom chunking requires" in str(excinfo.value.detail)
+    assert not (tmp_path / "custom.[native-C].docx").exists()
+
+
+async def test_upload_accepts_c_when_custom_callback_is_injected(tmp_path, monkeypatch):
+    import importlib
+
+    monkeypatch.setattr(
+        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
+    )
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _DuplicateUploadRag({}, chunking_func=lambda *args, **kwargs: [])
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+
+    async def _no_op_index(rag_arg, file_path, track_id=None, admission_token=None):
+        return None
+
+    monkeypatch.setattr(_document_routes, "pipeline_index_file", _no_op_index)
+    router = create_document_routes(rag, doc_manager)
+    upload_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "upload_to_input_dir"
+    ][-1]
+    upload_file = _document_routes.UploadFile(
+        filename="custom.[native-C].docx",
+        file=BytesIO(b"docx bytes"),
+    )
+
+    managed: set = set()
+    response = await upload_endpoint(managed, upload_file)
+    await _await_managed(managed)
+
+    assert response.status == "success"
+    assert (tmp_path / "custom.[native-C].docx").exists()
+
+
 async def test_upload_succeeds_concurrent_with_pipeline_busy(tmp_path, monkeypatch):
     """Under the new contract, ``busy=True`` no longer blocks uploads.
     The upload reserves a pending-enqueue slot, schedules its bg task,
     and returns success; the bg task's enqueue is permitted while the
-    pipeline is busy and the running loop's request_pending mechanism
-    will pick up the new doc after its current batch.
+    pipeline is busy and the running loop picks up the new doc via the
+    ingress mailbox.
     """
     import importlib
 
@@ -1087,7 +1545,7 @@ async def test_upload_succeeds_concurrent_with_pipeline_busy(tmp_path, monkeypat
 
     gate = asyncio.Event()
 
-    async def _gated_index(rag_arg, file_path, track_id=None):
+    async def _gated_index(rag_arg, file_path, track_id=None, admission_token=None):
         await gate.wait()
 
     monkeypatch.setattr(_document_routes, "pipeline_index_file", _gated_index)
@@ -1150,12 +1608,51 @@ async def test_upload_returns_409_when_scanning_classification(tmp_path, monkeyp
     assert not (tmp_path / "while_scanning.docx").exists()
 
 
+async def test_upload_returns_409_when_manual_freeze(tmp_path, monkeypatch):
+    """LR2 Phase 3: while a manual retry has frozen new ingress
+    (``manual_freeze_requested=True``) to drain the pipeline and reset FAILED,
+    a new upload must refuse with 409 (MANUAL_FREEZE) — not silently land in a
+    window that violates the reset's "no failed producer" precondition."""
+    import importlib
+
+    monkeypatch.setattr(
+        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
+    )
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _DuplicateUploadRag({})
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+    pipeline_status["busy"] = True
+    pipeline_status["manual_freeze_requested"] = True
+
+    router = create_document_routes(rag, doc_manager)
+    upload_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "upload_to_input_dir"
+    ][-1]
+    upload_file = _document_routes.UploadFile(
+        filename="while_freezing.docx",
+        file=BytesIO(b"docx bytes"),
+    )
+
+    with pytest.raises(_document_routes.HTTPException) as excinfo:
+        await upload_endpoint(set(), upload_file)
+    assert excinfo.value.status_code == 409
+    assert "retry of failed documents" in excinfo.value.detail.lower()
+    assert not (tmp_path / "while_freezing.docx").exists()
+
+
 async def test_upload_succeeds_during_scan_processing_phase(tmp_path, monkeypatch):
     """User-reported scenario: while pipeline is doing scan-driven
     processing (``scanning=True`` but ``scanning_exclusive=False``),
     new uploads must be accepted.  Scan's processing phase is
-    behaviourally identical to busy=True — uploads coexist via
-    request_pending.
+    behaviourally identical to busy=True — uploads coexist via the
+    ingress mailbox.
     """
     import importlib
 
@@ -1191,7 +1688,7 @@ async def test_upload_succeeds_during_scan_processing_phase(tmp_path, monkeypatc
 
     gate = asyncio.Event()
 
-    async def _gated_index(rag_arg, file_path, track_id=None):
+    async def _gated_index(rag_arg, file_path, track_id=None, admission_token=None):
         await gate.wait()
 
     monkeypatch.setattr(_document_routes, "pipeline_index_file", _gated_index)
@@ -1240,6 +1737,10 @@ async def test_scan_endpoint_returns_skipped_when_pipeline_busy(tmp_path):
     assert len(managed) == 0
     # And ``scanning`` is left unchanged at False (we didn't acquire it).
     assert pipeline_status.get("scanning") is False
+    # Zero side effects: a refused scan publishes NO manual retry intent —
+    # the sticky request is committed only AFTER the reservation is granted.
+    ingress = await shared_storage.get_pipeline_ingress(rag.workspace)
+    assert ingress.snapshot_manual_retries() == []
 
 
 async def test_scan_endpoint_returns_skipped_when_already_scanning(tmp_path):
@@ -1409,8 +1910,8 @@ async def test_release_enqueue_slot_decrements_per_call(tmp_path):
     """Two-reservation cohort: each release is a pure decrement.  Drain
     coordination is no longer needed because the busy guard on enqueue
     has been removed — concurrent enqueues are permitted while the
-    pipeline is busy and the running loop's request_pending mechanism
-    drains them.
+    pipeline is busy and the running loop drains them via the ingress
+    mailbox.
     """
     import importlib
 
@@ -1436,7 +1937,7 @@ async def test_release_enqueue_slot_decrements_per_call(tmp_path):
 
     # Each release removes its own token; count mirrors the set size. No drain
     # coordination required — each bg task triggers process_enqueue independently
-    # and the running loop's request_pending mechanism collapses duplicates.
+    # and the running loop's quiescence decision collapses duplicates.
     await _document_routes._release_enqueue_slot(rag, "enq-a")
     assert pipeline_status["pending_enqueues"] == 1
 
@@ -1507,8 +2008,9 @@ async def test_scan_endpoint_releases_reservation_on_cancellation_before_handoff
 ):
     """Regression (#3408): a cancellation delivered after the scan endpoint
     reserves ``scanning``/``scanning_exclusive`` but before the managed task
-    takes over (e.g. the request cancelled while start_reserved_background_task
-    awaits the start barrier) must not leak the reservation. The endpoint's
+    commits (pre-commit cancellation of start_committed_background_task) must
+    not leak the reservation — and must leave NO sticky manual retry request
+    behind (a refused/cancelled scan has zero side effects). The endpoint's
     finally releases the owner token so both flags return to False.
     """
     import asyncio
@@ -1531,12 +2033,12 @@ async def test_scan_endpoint_releases_reservation_on_cancellation_before_handoff
 
     async def _cancel_before_takeover(*args, **kwargs):
         # Simulate a cancellation delivered after scanning was reserved but
-        # before the managed task took over (request cancelled at the start
+        # before the managed task committed (request cancelled at the start
         # barrier). The endpoint's finally must still release the slot.
         raise asyncio.CancelledError()
 
     monkeypatch.setattr(
-        shared_storage, "start_reserved_background_task", _cancel_before_takeover
+        shared_storage, "start_committed_background_task", _cancel_before_takeover
     )
 
     router = create_document_routes(rag, doc_manager)
@@ -1554,6 +2056,9 @@ async def test_scan_endpoint_releases_reservation_on_cancellation_before_handoff
     assert pipeline_status.get("scanning") is False
     assert pipeline_status.get("scanning_exclusive") is False
     assert pipeline_status.get("scanning_owner") is None
+    # Pre-commit teardown published nothing: the mailbox has no manual entry.
+    ingress = await shared_storage.get_pipeline_ingress(rag.workspace)
+    assert ingress.snapshot_manual_retries() == []
 
 
 async def test_clear_endpoint_releases_destructive_busy_on_cancellation_during_setup(
@@ -1781,6 +2286,145 @@ async def test_delete_task_releases_when_cancelled_before_release_try(
     assert pipeline_status.get("busy_owner") is None
 
 
+async def test_delete_release_drives_processing_on_mailbox_work(tmp_path):
+    """The post-delete queue drive keys off the ingress ``has_work`` probe
+    inside the owner-checked release: work that landed in the mailbox while
+    the delete held the destructive slot (e.g. a busy-refused process request
+    arming auto-rescan) triggers exactly one drive; an empty mailbox releases
+    without driving."""
+    import importlib
+
+    workspace = f"delete-drive-{uuid4().hex}"
+    destructive_token = uuid4().hex
+
+    class _Rag:
+        pass
+
+    rag = _Rag()
+    rag.workspace = workspace
+    doc_manager = DocumentManager(str(tmp_path))
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=workspace
+    )
+    ingress = await shared_storage.get_pipeline_ingress(workspace)
+
+    drives = {"n": 0}
+
+    async def _process():
+        drives["n"] += 1
+
+    rag.apipeline_process_enqueue_documents = _process
+
+    async def _adelete_and_signal(doc_id, delete_llm_cache=False):
+        # A busy-refused process request lands while we hold the slot.
+        ingress.request_auto_rescan()
+        return SimpleNamespace(status="success", file_path="-", message="ok")
+
+    rag.adelete_by_doc_id = _adelete_and_signal
+
+    pipeline_status.update(
+        {"busy": True, "destructive_busy": True, "busy_owner": destructive_token}
+    )
+    await _document_routes.background_delete_documents(
+        rag, doc_manager, ["doc-1"], token=destructive_token
+    )
+    assert drives["n"] == 1  # mailbox work → exactly one drive
+    assert pipeline_status.get("busy") is False
+    assert pipeline_status.get("destructive_busy") is False
+
+    # Empty mailbox → release without driving.
+    ingress.consume_auto_rescan()
+
+    async def _adelete_quiet(doc_id, delete_llm_cache=False):
+        return SimpleNamespace(status="success", file_path="-", message="ok")
+
+    rag.adelete_by_doc_id = _adelete_quiet
+    pipeline_status.update(
+        {"busy": True, "destructive_busy": True, "busy_owner": destructive_token}
+    )
+    await _document_routes.background_delete_documents(
+        rag, doc_manager, ["doc-2"], token=destructive_token
+    )
+    assert drives["n"] == 1  # unchanged: nothing pending, no spurious drive
+    assert pipeline_status.get("busy") is False
+
+
+async def test_delete_release_fails_toward_drive_on_ingress_failures(
+    tmp_path, monkeypatch
+):
+    """Both delete-exit failure arms fail TOWARD the post-delete drive: an
+    ingress resolve failure and a ``has_work`` probe failure each still
+    release the destructive slot and fire exactly one busy-gated drive —
+    never a silent defer of work that arrived during the delete, never a
+    wedged slot."""
+    import importlib
+
+    workspace = f"delete-drive-fail-{uuid4().hex}"
+    destructive_token = uuid4().hex
+
+    class _Rag:
+        pass
+
+    rag = _Rag()
+    rag.workspace = workspace
+    doc_manager = DocumentManager(str(tmp_path))
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=workspace
+    )
+
+    drives = {"n": 0}
+
+    async def _process():
+        drives["n"] += 1
+
+    rag.apipeline_process_enqueue_documents = _process
+
+    async def _adelete(doc_id, delete_llm_cache=False):
+        return SimpleNamespace(status="success", file_path="-", message="ok")
+
+    rag.adelete_by_doc_id = _adelete
+
+    # Arm 1: the resolve itself fails → delete_exit_ingress=None → drive.
+    async def _broken_resolve(workspace=None):
+        raise RuntimeError("manager connection lost")
+
+    monkeypatch.setattr(shared_storage, "get_pipeline_ingress", _broken_resolve)
+    pipeline_status.update(
+        {"busy": True, "destructive_busy": True, "busy_owner": destructive_token}
+    )
+    await _document_routes.background_delete_documents(
+        rag, doc_manager, ["doc-1"], token=destructive_token
+    )
+    assert drives["n"] == 1  # exactly one drive, no loop
+    assert pipeline_status.get("busy") is False  # release still ran
+    assert pipeline_status.get("destructive_busy") is False
+
+    # Arm 2: the resolve succeeds but the in-lock has_work probe fails.
+    class _ProbeBroken:
+        def has_work(self):
+            raise RuntimeError("probe transport down")
+
+    async def _resolve_probe_broken(workspace=None):
+        return _ProbeBroken()
+
+    monkeypatch.setattr(shared_storage, "get_pipeline_ingress", _resolve_probe_broken)
+    pipeline_status.update(
+        {"busy": True, "destructive_busy": True, "busy_owner": destructive_token}
+    )
+    await _document_routes.background_delete_documents(
+        rag, doc_manager, ["doc-2"], token=destructive_token
+    )
+    assert drives["n"] == 2  # exactly one more drive
+    assert pipeline_status.get("busy") is False
+    assert pipeline_status.get("destructive_busy") is False
+
+
 async def test_release_destructive_helper_survives_fetch_cancellation(
     tmp_path, monkeypatch
 ):
@@ -1977,7 +2621,7 @@ async def test_two_concurrent_uploads_both_succeed_when_pipeline_busy(
 
     gate = asyncio.Event()
 
-    async def _gated_index(rag_arg, file_path, track_id=None):
+    async def _gated_index(rag_arg, file_path, track_id=None, admission_token=None):
         await gate.wait()
 
     monkeypatch.setattr(_document_routes, "pipeline_index_file", _gated_index)
@@ -2390,7 +3034,7 @@ async def test_upload_managed_task_released_on_shutdown_drain(tmp_path, monkeypa
 
     gate = asyncio.Event()
 
-    async def _gated_index(rag_arg, file_path, track_id=None):
+    async def _gated_index(rag_arg, file_path, track_id=None, admission_token=None):
         await gate.wait()
 
     monkeypatch.setattr(_document_routes, "pipeline_index_file", _gated_index)
@@ -2593,6 +3237,276 @@ async def test_background_delete_removes_parser_hint_file_variants(tmp_path):
     assert unrelated_file.exists()
 
 
+async def test_background_delete_duplicate_marker_preserves_shared_source_file(
+    tmp_path,
+):
+    """Deleting a ``dup-*`` status row must not delete the primary's file.
+
+    Duplicate-attempt rows deliberately share the primary document's canonical
+    ``file_path``.  That value is display metadata for the marker, not ownership
+    of the physical source file.
+    """
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    source_file = tmp_path / "paper.pdf"
+    source_file.write_bytes(b"primary source")
+    doc_manager = DocumentManager(str(tmp_path))
+    duplicate_id = "dup-attempt"
+    rag = _DeleteRag(
+        DeletionResult(
+            status="success",
+            doc_id=duplicate_id,
+            message="deleted duplicate marker",
+            file_path="paper.pdf",
+        ),
+        status_rows={
+            duplicate_id: {
+                "file_path": "paper.pdf",
+                "metadata": {
+                    "is_duplicate": True,
+                    "original_doc_id": "doc-primary",
+                },
+            },
+            "doc-primary": {
+                "file_path": "paper.pdf",
+                "metadata": {},
+            },
+        },
+    )
+    shared_storage.initialize_share_data()
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+
+    await _document_routes.background_delete_documents(
+        rag,
+        doc_manager,
+        [duplicate_id],
+        delete_file=True,
+    )
+
+    assert rag.deleted_doc_ids == [(duplicate_id, False)]
+    assert source_file.read_bytes() == b"primary source"
+
+
+async def test_background_delete_post_parse_duplicate_removes_owned_archive(
+    tmp_path,
+):
+    """A demoted ``doc-*`` row still owns its unique archived source."""
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    parsed_dir = tmp_path / PARSED_DIR_NAME
+    parsed_dir.mkdir()
+    archived_source = parsed_dir / "twin.pdf"
+    archived_source.write_bytes(b"duplicate content under a unique filename")
+    artifact_dir = parsed_dir / "twin.pdf.parsed"
+    artifact_dir.mkdir()
+    sidecar = artifact_dir / "twin.blocks.jsonl"
+    sidecar.write_text("{}", encoding="utf-8")
+    primary_source = parsed_dir / "primary.pdf"
+    primary_source.write_bytes(b"primary source")
+    doc_manager = DocumentManager(str(tmp_path))
+    duplicate_id = "doc-twin"
+    rag = _DeleteRag(
+        DeletionResult(
+            status="success",
+            doc_id=duplicate_id,
+            message="deleted post-parse duplicate",
+            file_path="twin.pdf",
+        ),
+        status_rows={
+            duplicate_id: {
+                "file_path": "twin.pdf",
+                "metadata": {
+                    "is_duplicate": True,
+                    "duplicate_kind": "content_hash",
+                    "original_doc_id": "doc-primary",
+                },
+            },
+            "doc-primary": {
+                "file_path": "primary.pdf",
+                "metadata": {},
+            },
+        },
+    )
+    shared_storage.initialize_share_data()
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+
+    await _document_routes.background_delete_documents(
+        rag,
+        doc_manager,
+        [duplicate_id],
+        delete_file=True,
+    )
+
+    assert rag.deleted_doc_ids == [(duplicate_id, False)]
+    assert not archived_source.exists()
+    assert not artifact_dir.exists()
+    assert not sidecar.exists()
+    assert primary_source.read_bytes() == b"primary source"
+
+
+async def test_background_delete_primary_still_removes_source_file(tmp_path):
+    """The duplicate guard must not weaken ordinary ``delete_file=True``."""
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    source_file = tmp_path / "paper.pdf"
+    source_file.write_bytes(b"primary source")
+    doc_manager = DocumentManager(str(tmp_path))
+    primary_id = "doc-primary"
+    rag = _DeleteRag(
+        DeletionResult(
+            status="success",
+            doc_id=primary_id,
+            message="deleted primary document",
+            file_path="paper.pdf",
+        ),
+        status_rows={
+            primary_id: {
+                "file_path": "paper.pdf",
+                "metadata": {},
+            }
+        },
+    )
+    shared_storage.initialize_share_data()
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+
+    await _document_routes.background_delete_documents(
+        rag,
+        doc_manager,
+        [primary_id],
+        delete_file=True,
+    )
+
+    assert rag.deleted_doc_ids == [(primary_id, False)]
+    assert not source_file.exists()
+
+
+class _FailingOwnershipDocStatus(_DeleteDocStatus):
+    """Simulates a transient backend read failure during the ownership check.
+
+    Mirrors real backend semantics: the legacy ``get_doc_by_file_basename``
+    swallows the failure and returns ``None`` (mongo/redis/opensearch
+    "best-effort miss"), while ``resolve_doc_source_strict`` raises per its
+    fail-closed contract. An ownership check built on the legacy lookup reads
+    the swallowed failure as "unreferenced" and deletes the shared file.
+    """
+
+    async def get_doc_by_file_basename(self, basename: str):
+        return None
+
+    async def resolve_doc_source_strict(self, canonical_source_key: str):
+        raise RuntimeError("simulated backend read failure")
+
+
+async def test_background_delete_ownership_lookup_failure_preserves_file(tmp_path):
+    """A swallowed/raised lookup failure must never delete a shared file."""
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    source_file = tmp_path / "paper.pdf"
+    source_file.write_bytes(b"primary source")
+    doc_manager = DocumentManager(str(tmp_path))
+    duplicate_id = "dup-attempt"
+    rag = _DeleteRag(
+        DeletionResult(
+            status="success",
+            doc_id=duplicate_id,
+            message="deleted duplicate marker",
+            file_path="paper.pdf",
+        ),
+        status_rows={
+            duplicate_id: {
+                "file_path": "paper.pdf",
+                "metadata": {"is_duplicate": True},
+            },
+            "doc-primary": {
+                "file_path": "paper.pdf",
+                "metadata": {},
+            },
+        },
+    )
+    rag.doc_status = _FailingOwnershipDocStatus(rag.doc_status.rows)
+    shared_storage.initialize_share_data()
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+
+    await _document_routes.background_delete_documents(
+        rag,
+        doc_manager,
+        [duplicate_id],
+        delete_file=True,
+    )
+
+    # The record deletion itself still succeeds; only the physical file
+    # cleanup is suppressed (fail closed).
+    assert rag.deleted_doc_ids == [(duplicate_id, False)]
+    assert source_file.read_bytes() == b"primary source"
+
+
+async def test_background_delete_source_conflict_preserves_file(tmp_path):
+    """With a historical basename conflict, surviving primaries keep the file."""
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    source_file = tmp_path / "paper.pdf"
+    source_file.write_bytes(b"conflicted source")
+    doc_manager = DocumentManager(str(tmp_path))
+    deleted_id = "doc-a"
+    rag = _DeleteRag(
+        DeletionResult(
+            status="success",
+            doc_id=deleted_id,
+            message="deleted one conflicting primary",
+            file_path="paper.pdf",
+        ),
+        status_rows={
+            deleted_id: {"file_path": "paper.pdf", "metadata": {}},
+            "doc-b": {"file_path": "paper.pdf", "metadata": {}},
+            "doc-c": {"file_path": "paper.pdf", "metadata": {}},
+        },
+    )
+    shared_storage.initialize_share_data()
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+
+    await _document_routes.background_delete_documents(
+        rag,
+        doc_manager,
+        [deleted_id],
+        delete_file=True,
+    )
+
+    assert rag.deleted_doc_ids == [(deleted_id, False)]
+    assert source_file.read_bytes() == b"conflicted source"
+
+
+async def test_background_delete_stale_self_match_preserves_file(tmp_path):
+    """An eventually-consistent index may still return the deleted row itself."""
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    source_file = tmp_path / "paper.pdf"
+    source_file.write_bytes(b"primary source")
+    doc_manager = DocumentManager(str(tmp_path))
+    deleted_id = "doc-stale"
+
+    class _StaleDocStatus(_DeleteDocStatus):
+        async def resolve_doc_source_strict(self, canonical_source_key: str):
+            return SourceUnique(
+                doc_id=deleted_id, doc={"file_path": canonical_source_key}
+            )
+
+    rag = _DeleteRag(
+        DeletionResult(
+            status="success",
+            doc_id=deleted_id,
+            message="deleted document",
+            file_path="paper.pdf",
+        ),
+    )
+    rag.doc_status = _StaleDocStatus()
+    shared_storage.initialize_share_data()
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+
+    await _document_routes.background_delete_documents(
+        rag,
+        doc_manager,
+        [deleted_id],
+        delete_file=True,
+    )
+
+    assert rag.deleted_doc_ids == [(deleted_id, False)]
+    assert source_file.read_bytes() == b"primary source"
+
+
 async def test_docx_archive_failure_is_best_effort(tmp_path, monkeypatch):
     file_path = tmp_path / "archive-failure.docx"
     file_path.write_bytes(b"docx bytes")
@@ -2665,7 +3579,7 @@ async def test_parse_native_archives_docx_after_full_docs_sync(tmp_path, monkeyp
     assert (parsed_artifact_dir / "parsed-after-sync.blocks.jsonl").is_file()
     assert rag.full_docs.data["doc-test"]["parse_engine"] == "native"
     assert rag.full_docs.data["doc-test"]["parse_format"] == "lightrag"
-    # Per docs/FileProcessingConfiguration-zh.md, content uses the {{LRdoc}}
+    # Per docs/FileProcessingPipeline.md, content uses the {{LRdoc}}
     # marker plus a leading-text summary derived from merged blocks.
     assert rag.full_docs.data["doc-test"]["content"].startswith("{{LRdoc}}")
 
@@ -2765,6 +3679,115 @@ def test_lightrag_document_reprocess_uses_full_docs_without_reparse():
     assert engine == "reuse"
 
 
+def test_sanitize_filename_rejects_traversal_instead_of_rewriting(tmp_path):
+    with pytest.raises(_document_routes.HTTPException) as exc:
+        _document_routes.sanitize_filename("../report.pdf", tmp_path)
+
+    assert exc.value.status_code == 400
+
+
+def test_sanitize_filename_rejects_separator_and_control_characters(tmp_path):
+    for filename in ("nested/report.pdf", "nested\\report.pdf", "report.pdf\x00"):
+        with pytest.raises(_document_routes.HTTPException) as exc:
+            _document_routes.sanitize_filename(filename, tmp_path)
+
+        assert exc.value.status_code == 400
+
+
+def test_sanitize_filename_rejects_colon(tmp_path):
+    for filename in (
+        "safe.pdf:payload.pdf",  # NTFS alternate-data-stream reference
+        "C:report.pdf",  # drive-relative, not a literal basename
+    ):
+        with pytest.raises(_document_routes.HTTPException) as exc:
+            _document_routes.sanitize_filename(filename, tmp_path)
+
+        assert exc.value.status_code == 400
+
+
+def test_sanitize_filename_allows_other_windows_reserved_characters(tmp_path):
+    """Unlike ':', these don't let the name be reinterpreted as a different
+    path (no shell-out or unescaped glob() call site uses upload filenames in
+    this codebase), so they're accepted rather than pre-emptively rejected."""
+    for filename in (
+        'quoted"name.pdf',
+        "piped|name.pdf",
+        "glob?name.pdf",
+        "glob*name.pdf",
+        "less<than.pdf",
+        "greater>than.pdf",
+    ):
+        assert _document_routes.sanitize_filename(filename, tmp_path) == filename
+
+
+def test_sanitize_filename_allows_non_traversal_dot_sequences(tmp_path):
+    filename = "report..final.pdf"
+
+    assert _document_routes.sanitize_filename(filename, tmp_path) == filename
+
+
+def test_upload_file_opener_refuses_existing_symlink(tmp_path):
+    outside = tmp_path / "outside.txt"
+    outside.write_text("keep", encoding="utf-8")
+    link = tmp_path / "safe.pdf"
+    link.symlink_to(outside)
+
+    opener = _document_routes.upload_file_opener(tmp_path)
+    with pytest.raises(FileExistsError):
+        with open(link, "xb", opener=opener):
+            pass
+
+    assert outside.read_text(encoding="utf-8") == "keep"
+
+
+def test_upload_file_opener_creates_new_file_with_private_permissions(tmp_path):
+    path = tmp_path / "safe.pdf"
+
+    opener = _document_routes.upload_file_opener(tmp_path)
+    with open(path, "xb", opener=opener) as fh:
+        fh.write(b"content")
+
+    assert path.read_bytes() == b"content"
+    assert (path.stat().st_mode & 0o777) == 0o600
+
+
+def test_upload_file_opener_falls_back_when_dir_fd_unsupported(tmp_path, monkeypatch):
+    """Simulates Windows: os.open() cannot bind a directory fd there at all,
+    so the opener must skip that step entirely rather than crash on it."""
+    monkeypatch.setattr(_document_routes, "_UPLOAD_DIR_FD_SUPPORTED", False)
+
+    real_open = _document_routes.os.open
+    directory_open_attempts = []
+
+    def spying_open(path, flags, mode=0o777, *, dir_fd=None):
+        if dir_fd is not None or str(path) == str(tmp_path):
+            directory_open_attempts.append((str(path), dir_fd))
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(_document_routes.os, "open", spying_open)
+
+    path = tmp_path / "safe.pdf"
+    opener = _document_routes.upload_file_opener(tmp_path)
+    with open(path, "xb", opener=opener) as fh:
+        fh.write(b"content")
+
+    assert path.read_bytes() == b"content"
+    assert (path.stat().st_mode & 0o777) == 0o600
+    assert directory_open_attempts == []
+
+    with pytest.raises(FileExistsError):
+        with open(path, "xb", opener=_document_routes.upload_file_opener(tmp_path)):
+            pass
+
+
+def test_sanitize_filename_preserves_safe_parser_hint_filename(tmp_path):
+    filename = "report.[native].docx"
+
+    assert _document_routes.sanitize_filename(filename, tmp_path) == filename
+
+
 def test_default_allowlist_equals_local_engine_suffixes(tmp_path, monkeypatch):
     """With no external endpoints and no routing rules, the registry-derived
     allowlist must equal the local engines' (legacy ∪ native) suffixes —
@@ -2826,7 +3849,7 @@ def test_third_party_engine_suffixes_join_allowlist_and_scan(tmp_path, monkeypat
     assert not dm.is_supported_file("sample.foo")
     (dm.input_dir / "sample.foo").write_text("x", encoding="utf-8")
     (dm.input_dir / "hinted.[fooengine].foo").write_text("x", encoding="utf-8")
-    assert not [p for p in dm.scan_directory_for_new_files() if p.suffix == ".foo"]
+    assert not [p for p in dm.iter_new_files() if p.suffix == ".foo"]
 
     registry.register_parser(
         registry.ParserSpec(
@@ -2843,14 +3866,14 @@ def test_third_party_engine_suffixes_join_allowlist_and_scan(tmp_path, monkeypat
         # The hinted file routes to fooengine: uploadable AND discoverable
         # by scan (glob covers the capability surface, filter is per-name).
         assert dm.is_supported_file("hinted.[fooengine].foo")
-        scanned = {p.name for p in dm.scan_directory_for_new_files()}
+        scanned = {p.name for p in dm.iter_new_files()}
         assert "hinted.[fooengine].foo" in scanned
         assert "sample.foo" not in scanned
         # A routing rule makes the bare suffix routable.
         monkeypatch.setenv("LIGHTRAG_PARSER", "foo:fooengine")
         assert ".foo" in dm.supported_extensions
         assert dm.is_supported_file("sample.foo")
-        assert "sample.foo" in {p.name for p in dm.scan_directory_for_new_files()}
+        assert "sample.foo" in {p.name for p in dm.iter_new_files()}
     finally:
         registry._REGISTRY.pop("fooengine", None)
     assert not dm.is_supported_file("sample.foo")

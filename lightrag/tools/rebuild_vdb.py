@@ -61,6 +61,7 @@ from lightrag.constants import (
     DEFAULT_COSINE_THRESHOLD,
     DEFAULT_EMBEDDING_BATCH_NUM,
 )
+from lightrag.exceptions import StorageCapabilityError
 from lightrag.kg import STORAGE_ENV_REQUIREMENTS
 from lightrag.namespace import NameSpace
 from lightrag.utils import (
@@ -95,23 +96,6 @@ RESET = "\033[0m"
 ProgressCallback = Callable[[int, int], None]
 
 
-def _strip_agtype_quotes(value: Any) -> Any:
-    """Strip surrounding double quotes from PostgreSQL/AGE agtype text casts.
-
-    PGGraphStorage.get_all_edges() extracts entity ids via an
-    ``agtype::text`` cast, which leaves string values wrapped in double
-    quotes (e.g. ``'"Alice"'``). Other backends return plain strings.
-    """
-    if (
-        isinstance(value, str)
-        and len(value) >= 2
-        and value[0] == '"'
-        and value[-1] == '"'
-    ):
-        return value[1:-1]
-    return value
-
-
 def _new_stats(label: str, source_total: int) -> Dict[str, Any]:
     return {
         "label": label,
@@ -129,6 +113,16 @@ def _new_stats(label: str, source_total: int) -> Dict[str, Any]:
         "failed_batches": 0,
         "errors": [],
     }
+
+
+def _ensure_vector_rebuild_supported(vdb) -> None:
+    if not getattr(vdb, "persists_vectors", True):
+        storage_name = type(vdb).__name__
+        raise StorageCapabilityError(
+            f"{storage_name} does not persist vectors and cannot be used as a "
+            "rebuild target. Configure a persistent vector storage before "
+            "calling the rebuild library API."
+        )
 
 
 async def _drop_vdb(vdb, label: str) -> None:
@@ -242,6 +236,7 @@ async def rebuild_entities_vdb(
     Payloads mirror the authoritative write point in
     operate._merge_nodes_then_upsert field for field.
     """
+    _ensure_vector_rebuild_supported(entities_vdb)
     from lightrag.operate import _truncate_vdb_content
 
     nodes = await graph.get_all_nodes()
@@ -249,7 +244,7 @@ async def rebuild_entities_vdb(
 
     payloads: Dict[str, Dict[str, Any]] = {}
     for node in nodes:
-        entity_name = _strip_agtype_quotes(node.get("entity_id") or node.get("id"))
+        entity_name = node.get("entity_id") or node.get("id")
         if entity_name is None or not str(entity_name).strip():
             stats["skipped"] += 1
             logger.warning(
@@ -302,6 +297,7 @@ async def rebuild_relationships_vdb(
     undirected edge once per direction (e.g. Neo4j, Memgraph) are deduplicated
     by that normalized id.
     """
+    _ensure_vector_rebuild_supported(relationships_vdb)
     from lightrag.operate import _truncate_vdb_content
 
     edges = await graph.get_all_edges()
@@ -309,8 +305,8 @@ async def rebuild_relationships_vdb(
 
     payloads: Dict[str, Dict[str, Any]] = {}
     for edge in edges:
-        src = _strip_agtype_quotes(edge.get("source"))
-        tgt = _strip_agtype_quotes(edge.get("target"))
+        src = edge.get("source")
+        tgt = edge.get("target")
         if src is None or tgt is None or not str(src).strip() or not str(tgt).strip():
             stats["skipped"] += 1
             logger.warning(
@@ -432,6 +428,7 @@ async def rebuild_chunks_vdb(
     keys (and silently drop a scheme), all keys are enumerated and the
     per-record ``content`` check below is the only filter.
     """
+    _ensure_vector_rebuild_supported(chunks_vdb)
     chunk_ids = [str(key) for key in await enumerate_kv_keys(text_chunks_kv)]
     stats = _new_stats("chunks", len(chunk_ids))
 
@@ -499,7 +496,7 @@ async def check_vdb_consistency(
     entity_items: List[tuple] = []
     seen_entity_ids: set = set()
     for node in nodes:
-        entity_name = _strip_agtype_quotes(node.get("entity_id") or node.get("id"))
+        entity_name = node.get("entity_id") or node.get("id")
         if entity_name is None or not str(entity_name).strip():
             report["skipped_nodes"] += 1
             continue
@@ -525,8 +522,8 @@ async def check_vdb_consistency(
     relation_items: List[tuple] = []
     seen_relation_ids: set = set()
     for edge in edges:
-        src = _strip_agtype_quotes(edge.get("source"))
-        tgt = _strip_agtype_quotes(edge.get("target"))
+        src = edge.get("source")
+        tgt = edge.get("target")
         if src is None or tgt is None or not str(src).strip() or not str(tgt).strip():
             report["skipped_edges"] += 1
             continue
@@ -624,11 +621,10 @@ class RebuildTool:
         global_config: Dict[str, Any] = {
             "working_dir": os.getenv("WORKING_DIR", "./rag_storage"),
             # Backend selection, mirroring LightRAG._build_global_config. PG
-            # storages derive enable_vector from global_config["vector_storage"]
-            # (ClientManager.get_config defaults enable_vector=True when it is
-            # absent), so a legal mixed config like PGGraphStorage +
-            # QdrantVectorDBStorage would otherwise make the tool wrongly try to
-            # initialize pgvector. Keep all three names for parity.
+            # storages derive enable_vector from global_config["vector_storage"],
+            # so this must carry the real backend name for a mixed config like
+            # PGGraphStorage + QdrantVectorDBStorage to resolve correctly. Keep all
+            # three names for parity.
             "kv_storage": self.storage_names["kv"],
             "vector_storage": self.storage_names["vector"],
             "graph_storage": self.storage_names["graph"],

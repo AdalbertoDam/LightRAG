@@ -10,8 +10,9 @@
     "documents": "文档",
     "knowledgeGraph": "知识图谱",
     "retrieval": "检索",
-    "api": "API",
+    "apiDocs": "API 文档",
     "projectRepository": "项目仓库",
+    "appSettings": "设置",
     "logout": "退出登录",
     "frontendNeedsRebuild": "前端代码需重新构建",
     "themeToggle": {
@@ -37,7 +38,10 @@
     "cancel": "取消",
     "save": "保存",
     "saving": "保存中...",
-    "saveFailed": "保存失败"
+    "saveFailed": "保存失败",
+    "errorBoundaryTitle": "出错了",
+    "errorBoundaryDescription": "此面板渲染失败。请重试，或切换到其他标签页。",
+    "errorBoundaryRetry": "重试"
   },
   "documentPanel": {
     "clearDocuments": {
@@ -99,7 +103,7 @@
         "error": "部分文件上传失败"
       },
       "generalError": "上传失败\n{{error}}",
-      "fileTypes": "支持的文件类型：TXT, MD, TEXTPACK, MDX, DOCX, PDF, PPTX, XLSX, RTF, ODT, EPUB, HTML, HTM, TEX, JSON, XML, YAML, YML, CSV, LOG, CONF, INI, PROPERTIES, SQL, BAT, SH, C, CPP, H, HPP, PY, JAVA, JS, TS, SWIFT, GO, RB, PHP, CSS, SCSS, LESS",
+      "fileTypes": "支持的文件类型：{{types}}",
       "fileUploader": {
         "singleFileLimit": "一次只能上传一个文件",
         "maxFilesLimit": "最多只能上传 {{count}} 个文件",
@@ -139,18 +143,18 @@
       "filters": {
         "all": "全部",
         "completed": "已完成",
-        "parse": "内容解析",
+        "parse": "文件解析",
         "analyze": "模态分析",
-        "process": "抽取处理",
+        "process": "图谱处理",
         "failed": "失败"
       },
       "status": {
         "all": "全部",
         "completed": "已完成",
         "preprocessed": "预处理",
-        "parsing": "内容提取",
-        "analyzing": "分析中",
-        "processing": "处理中",
+        "parsing": "文件解析",
+        "analyzing": "模态分析",
+        "processing": "图谱处理",
         "pending": "等待中",
         "failed": "失败"
       },
@@ -177,7 +181,6 @@
     "pipelineStatus": {
       "title": "流水线状态",
       "busy": "流水线忙碌",
-      "requestPending": "待处理请求",
       "cancellationRequested": "取消请求",
       "jobName": "作业名称",
       "startTime": "开始时间",
@@ -330,6 +333,7 @@
       "editPropertyDescription": "在下方文本区域编辑属性值。",
       "errors": {
         "duplicateName": "节点名称已存在",
+        "invalidEntityName": "请输入有效的节点名称",
         "updateFailed": "更新节点失败",
         "tryAgainLater": "请稍后重试",
         "updateSuccessButMergeFailed": "属性已更新，但合并失败：{{error}}",
@@ -424,6 +428,7 @@
     },
     "retrieval": {
       "startPrompt": "输入查询开始检索",
+      "scrollToBottom": "回到最新消息",
       "clear": "清空",
       "send": "发送",
       "stop": "停止",
@@ -481,9 +486,6 @@
       "enableRerank": "启用重排",
       "enableRerankTooltip": "为检索到的文本块启用重排。如果为True但未配置重排模型，将发出警告。默认为True。"
     }
-  },
-  "apiSite": {
-    "loading": "正在加载 API 文档..."
   },
   "apiKeyAlert": {
     "title": "需要 API Key",

@@ -18,6 +18,7 @@ Three concerns:
    scheduling any background work) for a malformed body.
 """
 
+import asyncio
 import importlib
 import sys
 from types import SimpleNamespace
@@ -26,6 +27,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+
+from lightrag.chunker import chunking_by_token_size
 
 _original_argv = sys.argv[:]
 sys.argv = [sys.argv[0]]
@@ -38,6 +41,7 @@ _resolve_text_chunking = _dr._resolve_text_chunking
 create_document_routes = _dr.create_document_routes
 
 from lightrag.constants import (  # noqa: E402
+    DEFAULT_SENTENCE_SPLIT_REGEX,
     PROCESS_OPTION_CHUNK_FIXED,
     PROCESS_OPTION_CHUNK_PARAGRAH,
     PROCESS_OPTION_CHUNK_RECURSIVE,
@@ -105,9 +109,42 @@ _ALL_STRATEGY_KEYS = {
             },
         },
         {
-            # malformed regex must be compiled/rejected at parse time
+            # nan bypasses ``amt <= 0`` / ``amt > 100``; reject before chunker.
+            "strategy": "semantic_vector",
+            "params": {
+                "breakpoint_threshold_type": "percentile",
+                "breakpoint_threshold_amount": float("nan"),
+            },
+        },
+        {
+            "strategy": "semantic_vector",
+            "params": {
+                "breakpoint_threshold_type": "percentile",
+                "breakpoint_threshold_amount": float("inf"),
+            },
+        },
+        {
+            # sentence_split_regex is env-only (GHSA-32jh-39m7-8x84): every
+            # form of it is rejected by extra="forbid", malformed ...
             "strategy": "semantic_vector",
             "params": {"sentence_split_regex": "("},
+        },
+        {
+            # ... well-formed ...
+            "strategy": "semantic_vector",
+            "params": {"sentence_split_regex": r"(?<=[.?!])\s+"},
+        },
+        {
+            # ... and catastrophically backtracking alike.
+            "strategy": "semantic_vector",
+            "params": {"sentence_split_regex": "(a+)+$"},
+        },
+        {
+            # An over-long separator cascade is uncapped work on the event loop
+            # (R chunking is synchronous), not a ReDoS — see the comment on
+            # RecursiveCharacterChunkParams.separators.
+            "strategy": "recursive_character",
+            "params": {"separators": [f"@@{i}@@" for i in range(65)]},
         },
         # cross-field
         {
@@ -180,14 +217,24 @@ def test_chunking_config_accepts_int_amount_widened_to_float():
     assert cfg_json.params == {"breakpoint_threshold_amount": 95.0}
 
 
-def test_chunking_config_accepts_valid_sentence_split_regex():
-    cfg = TextChunkingConfig.model_validate(
-        {
-            "strategy": "semantic_vector",
-            "params": {"sentence_split_regex": r"(?<=[.?!])\s+"},
-        }
-    )
-    assert cfg.params == {"sentence_split_regex": r"(?<=[.?!])\s+"}
+def test_chunking_config_rejects_sentence_split_regex():
+    # GHSA-32jh-39m7-8x84: the pattern is applied to request-supplied text by
+    # re.split, and re.compile bounds syntax but not running time. The knob is
+    # env-only now (CHUNK_V_SENTENCE_SPLIT_REGEX), so the rejection must be
+    # unconditional — not a filter that lets "safe-looking" patterns through.
+    # The default pattern itself is used here precisely because it is benign:
+    # if even this one is refused, no request-supplied pattern can reach the
+    # chunker.
+    with pytest.raises(ValidationError) as excinfo:
+        TextChunkingConfig.model_validate(
+            {
+                "strategy": "semantic_vector",
+                "params": {"sentence_split_regex": DEFAULT_SENTENCE_SPLIT_REGEX},
+            }
+        )
+    # extra="forbid" is what enforces this; assert the mechanism so a future
+    # refactor that re-adds the field as Optional[str] fails loudly here.
+    assert excinfo.value.errors()[0]["type"] == "extra_forbidden"
 
 
 def test_chunking_config_drops_explicit_null():
@@ -231,7 +278,15 @@ def test_insert_text_request_rejects_malformed_chunking():
 
 def _stub_rag(addon_params=None):
     return SimpleNamespace(
-        addon_params=addon_params if addon_params is not None else {}
+        addon_params=addon_params if addon_params is not None else {},
+        chunking_func=chunking_by_token_size,
+    )
+
+
+def _stub_rag_with_custom_chunker(addon_params=None):
+    return SimpleNamespace(
+        addon_params=addon_params if addon_params is not None else {},
+        chunking_func=lambda *args, **kwargs: [],
     )
 
 
@@ -276,6 +331,17 @@ def test_resolve_merges_strategy_params():
     assert chunk_options["recursive_character"]["chunk_overlap_token_size"] == 0
 
 
+def test_chunking_config_accepts_a_separator_cascade_at_the_cap():
+    # The cap exists to bound ``len(separators) x len(text)`` work on the event
+    # loop, not to restrict real cascades: the built-in one is 9 entries, and a
+    # list right at the limit must still be accepted.
+    cascade = [f"sep{i}" for i in range(64)]
+    cfg = TextChunkingConfig.model_validate(
+        {"strategy": "recursive_character", "params": {"separators": cascade}}
+    )
+    assert cfg.params["separators"] == cascade
+
+
 def test_resolve_size_overrides_env_for_recursive(monkeypatch):
     monkeypatch.setenv("CHUNK_R_SIZE", "999")
     addon = {"chunker": default_chunker_config()}
@@ -287,6 +353,25 @@ def test_resolve_size_overrides_env_for_recursive(monkeypatch):
     _, chunk_options = _resolve_text_chunking(cfg, _stub_rag(addon))
     # API value wins over the env-derived sub-dict value.
     assert chunk_options["recursive_character"]["chunk_token_size"] == 1234
+
+
+def test_resolve_sentence_split_regex_comes_from_env_only(monkeypatch):
+    # The counterpart to the API-side removal (GHSA-32jh-39m7-8x84): dropping
+    # the request field must not cost the operator the knob. The env value has
+    # to survive into the resolved V sub-dict, and — since no request can carry
+    # the key any more — it is by construction the only value the chunker can
+    # ever see.
+    custom = r"(?<=[.!?])\s+"
+    monkeypatch.setenv("CHUNK_V_SENTENCE_SPLIT_REGEX", custom)
+    addon = {"chunker": default_chunker_config()}
+    assert addon["chunker"]["semantic_vector"]["sentence_split_regex"] == custom
+    cfg = TextChunkingConfig.model_validate(
+        {"strategy": "semantic_vector", "params": {"buffer_size": 2}}
+    )
+    _, chunk_options = _resolve_text_chunking(cfg, _stub_rag(addon))
+    assert chunk_options["semantic_vector"]["sentence_split_regex"] == custom
+    # The unrelated param in the same request still merges normally.
+    assert chunk_options["semantic_vector"]["buffer_size"] == 2
 
 
 def test_resolve_split_by_character_only_false_overrides_env(monkeypatch):
@@ -428,6 +513,55 @@ def test_resolve_null_size_does_not_erase_inherited_default(monkeypatch):
     assert chunk_options["fixed_token"]["chunk_token_size"] == 640
 
 
+def test_custom_chunking_reuses_the_fixed_token_parameter_contract():
+    cfg = TextChunkingConfig.model_validate(
+        {
+            "strategy": "custom",
+            "params": {
+                "chunk_token_size": 512,
+                "chunk_overlap_token_size": 32,
+                "split_by_character": "\n\n",
+                "split_by_character_only": False,
+            },
+        }
+    )
+    assert cfg.params == {
+        "chunk_token_size": 512,
+        "chunk_overlap_token_size": 32,
+        "split_by_character": "\n\n",
+        "split_by_character_only": False,
+    }
+
+
+def test_custom_chunking_rejects_params_outside_the_legacy_contract():
+    with pytest.raises(ValidationError):
+        TextChunkingConfig.model_validate(
+            {"strategy": "custom", "params": {"buffer_size": 2}}
+        )
+
+
+def test_resolve_custom_requires_a_non_default_callback():
+    cfg = TextChunkingConfig.model_validate({"strategy": "custom"})
+    with pytest.raises(ValueError, match="custom chunking requires"):
+        _resolve_text_chunking(cfg, _stub_rag())
+
+
+def test_resolve_custom_maps_to_c_and_a_fixed_token_snapshot():
+    cfg = TextChunkingConfig.model_validate(
+        {
+            "strategy": "custom",
+            "params": {"chunk_token_size": 333, "chunk_overlap_token_size": 11},
+        }
+    )
+    process_options, chunk_options = _resolve_text_chunking(
+        cfg, _stub_rag_with_custom_chunker()
+    )
+    assert process_options == "C"
+    assert set(chunk_options) <= {"chunk_token_size", "fixed_token"}
+    assert chunk_options["fixed_token"]["chunk_token_size"] == 333
+    assert chunk_options["fixed_token"]["chunk_overlap_token_size"] == 11
+
+
 # ---------------------------------------------------------------------------
 # 3. Route forwarding + synchronous 422
 # ---------------------------------------------------------------------------
@@ -441,15 +575,30 @@ class _FwdDocStatus:
 class _FwdRag:
     workspace = "chunk-fwd-test"
     addon_params: dict = {}
+    chunking_func = chunking_by_token_size
 
     def __init__(self):
         self.doc_status = _FwdDocStatus()
 
 
+class _CallbackRemovalRag(_FwdRag):
+    def __init__(self, chunking_func):
+        super().__init__()
+        self.chunking_func = chunking_func
+        self.enqueued: list[dict] = []
+        self.process_calls = 0
+
+    async def apipeline_enqueue_documents(self, **kwargs):
+        self.enqueued.append(kwargs)
+
+    async def apipeline_process_enqueue_documents(self):
+        self.process_calls += 1
+
+
 _HEADERS = {"X-API-Key": "test-key"}
 
 
-def _make_client(monkeypatch, addon_params=None):
+def _make_client(monkeypatch, addon_params=None, chunking_func=chunking_by_token_size):
     """Build a TestClient whose enqueue-slot guards are no-ops and whose
     ``pipeline_index_texts`` is a spy recording the forwarded args.
 
@@ -459,10 +608,19 @@ def _make_client(monkeypatch, addon_params=None):
     """
     captured: dict = {}
 
-    async def _spy(rag, texts, file_sources=None, track_id=None, chunking=None):
+    async def _spy(
+        rag,
+        texts,
+        file_sources=None,
+        track_id=None,
+        chunking=None,
+        resolved_chunking=None,
+        admission_token=None,
+    ):
         captured["texts"] = texts
         captured["file_sources"] = file_sources
         captured["chunking"] = chunking
+        captured["resolved_chunking"] = resolved_chunking
 
     async def _noop_reserve(rag, token):
         return False
@@ -476,6 +634,7 @@ def _make_client(monkeypatch, addon_params=None):
 
     rag = _FwdRag()
     rag.addon_params = addon_params if addon_params is not None else {}
+    rag.chunking_func = chunking_func
 
     app = FastAPI()
     # The endpoints start reservation-holding work as managed asyncio tasks via
@@ -486,6 +645,51 @@ def _make_client(monkeypatch, addon_params=None):
         create_document_routes(rag, SimpleNamespace(), api_key="test-key")
     )
     return TestClient(app), captured
+
+
+def _make_callback_removal_client(monkeypatch):
+    """Run managed work after removing the callback accepted at preflight."""
+
+    def custom(*args, **kwargs):
+        return []
+
+    rag = _CallbackRemovalRag(custom)
+
+    async def _noop_reserve(rag, token):
+        return False
+
+    async def _noop_release(rag, token):
+        return None
+
+    async def _noop_reweight(rag, token, weight):
+        return None
+
+    async def _run_after_callback_removal(background_tasks, *, work, backstop_release):
+        # This hook runs only after the endpoint's synchronous preflight. Model
+        # a runtime deployment change in the exact window called out by review:
+        # the accepted request must retain its frozen C snapshot even though the
+        # processing callback is gone by the time managed work starts.
+        rag.chunking_func = chunking_by_token_size
+        started = asyncio.Event()
+        await work(started)
+        assert started.is_set()
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    monkeypatch.setattr(_dr, "_reserve_enqueue_slot", _noop_reserve)
+    monkeypatch.setattr(_dr, "_release_enqueue_slot", _noop_release)
+    monkeypatch.setattr(_dr, "_reweight_enqueue_slot", _noop_reweight)
+    monkeypatch.setattr(
+        shared_storage,
+        "start_reserved_background_task",
+        _run_after_callback_removal,
+    )
+
+    app = FastAPI()
+    app.state.background_tasks = set()
+    app.include_router(
+        create_document_routes(rag, SimpleNamespace(), api_key="test-key")
+    )
+    return TestClient(app), rag
 
 
 def test_insert_text_forwards_chunking(monkeypatch):
@@ -538,6 +742,104 @@ def test_insert_text_without_chunking_forwards_none(monkeypatch):
     assert captured["chunking"] is None
 
 
+@pytest.mark.parametrize(
+    "path,payload",
+    [
+        (
+            "/documents/text",
+            {
+                "text": "hello",
+                "file_source": "a.md",
+                "chunking": {"strategy": "custom"},
+            },
+        ),
+        (
+            "/documents/texts",
+            {
+                "texts": ["hello"],
+                "file_sources": ["a.md"],
+                "chunking": {"strategy": "custom"},
+            },
+        ),
+    ],
+)
+def test_text_ingress_rejects_custom_without_an_injected_callback(
+    monkeypatch, path, payload
+):
+    client, captured = _make_client(monkeypatch)
+    response = client.post(path, headers=_HEADERS, json=payload)
+    assert response.status_code == 422
+    assert "custom chunking requires" in str(response.json()["detail"])
+    assert captured == {}
+
+
+def test_text_ingress_accepts_custom_with_an_injected_callback(monkeypatch):
+    def custom(*args, **kwargs):
+        return []
+
+    client, captured = _make_client(monkeypatch, chunking_func=custom)
+    response = client.post(
+        "/documents/text",
+        headers=_HEADERS,
+        json={
+            "text": "hello",
+            "file_source": "a.md",
+            "chunking": {
+                "strategy": "custom",
+                "params": {"chunk_token_size": 400},
+            },
+        },
+    )
+    assert response.status_code == 200
+    assert captured["chunking"].strategy == "custom"
+    assert captured["chunking"].params == {"chunk_token_size": 400}
+
+
+@pytest.mark.parametrize(
+    "path,payload,expected_inputs",
+    [
+        (
+            "/documents/text",
+            {
+                "text": "hello",
+                "file_source": "a.md",
+                "chunking": {
+                    "strategy": "custom",
+                    "params": {"chunk_token_size": 400},
+                },
+            },
+            ["hello"],
+        ),
+        (
+            "/documents/texts",
+            {
+                "texts": ["one", "two"],
+                "file_sources": ["a.md", "b.md"],
+                "chunking": {
+                    "strategy": "custom",
+                    "params": {"chunk_token_size": 400},
+                },
+            },
+            ["one", "two"],
+        ),
+    ],
+)
+def test_accepted_custom_request_keeps_preflight_snapshot_after_callback_removal(
+    monkeypatch, path, payload, expected_inputs
+):
+    client, rag = _make_callback_removal_client(monkeypatch)
+
+    response = client.post(path, headers=_HEADERS, json=payload)
+
+    assert response.status_code == 200
+    assert rag.process_calls == 1
+    assert len(rag.enqueued) == 1
+    enqueue = rag.enqueued[0]
+    assert enqueue["input"] == expected_inputs
+    assert enqueue["process_options"] == "C"
+    assert enqueue["chunk_options"]["fixed_token"]["chunk_token_size"] == 400
+
+
 def test_insert_text_returns_422_on_malformed_chunking_without_scheduling(monkeypatch):
     client, captured = _make_client(monkeypatch)
     resp = client.post(
@@ -555,6 +857,34 @@ def test_insert_text_returns_422_on_malformed_chunking_without_scheduling(monkey
     assert resp.status_code == 422
     # Body validation fails before the endpoint body runs: no background
     # indexing is scheduled, so the spy never fires.
+    assert captured == {}
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_insert_text_returns_422_on_nonfinite_breakpoint_amount(monkeypatch, bad):
+    """Non-finite amounts must 422 on the HTTP path, not 500 via JSONResponse."""
+    import json
+
+    client, captured = _make_client(monkeypatch)
+    payload = {
+        "text": "hello",
+        "file_source": "a.md",
+        "chunking": {
+            "strategy": "semantic_vector",
+            "params": {
+                "breakpoint_threshold_type": "percentile",
+                "breakpoint_threshold_amount": bad,
+            },
+        },
+    }
+    resp = client.post(
+        "/documents/text",
+        headers={**_HEADERS, "Content-Type": "application/json"},
+        content=json.dumps(payload, allow_nan=True),
+    )
+    assert resp.status_code == 422
+    body = resp.json()
+    assert "detail" in body
     assert captured == {}
 
 
@@ -581,6 +911,74 @@ def test_insert_text_returns_422_when_size_below_inherited_overlap(monkeypatch):
     )
     assert resp.status_code == 422
     assert "chunk_overlap_token_size" in resp.json()["detail"]
+    # Rejected synchronously: background indexing never scheduled.
+    assert captured == {}
+
+
+@pytest.mark.parametrize(
+    "path, body",
+    [
+        (
+            "/documents/text",
+            {
+                "text": "hello",
+                "file_source": "a.md",
+                "chunking": {
+                    "strategy": "fixed_token",
+                    "params": {"chunk_token_size": 50},
+                },
+            },
+        ),
+        (
+            "/documents/texts",
+            {
+                "texts": ["hello"],
+                "file_sources": ["a.md"],
+                "chunking": {
+                    "strategy": "fixed_token",
+                    "params": {"chunk_token_size": 50},
+                },
+            },
+        ),
+    ],
+)
+def test_insert_422_detail_is_wrapped_not_raw_exception(monkeypatch, path, body):
+    """The synchronous chunking-config 422 must not be a bare ``detail=str(exc)``
+    passthrough (GHSA-hrmj-7rvj-4hg8 / CWE-209).
+
+    The overlap-vs-size check raises the app's own controlled ``ValueError`` in
+    ``_resolve_text_chunking``; the handler wraps it as an explicit
+    ``"Invalid chunking configuration: ..."`` message. This pins, for both
+    /documents/text and /documents/texts:
+
+    - the wrapper prefix is present — the regression proof; the pre-fix code
+      returned the bare ``str(exc)`` with no prefix, so this assertion fails on
+      the old code and passes on the new;
+    - the offending config field still reaches the client (422 validation UX
+      preserved — we deliberately keep this feedback rather than genericizing);
+    - the body carries none of the raw-exception / infrastructure markers a
+      generic ``except Exception`` dump would leak (traceback text, object
+      reprs, absolute filesystem paths, errno).
+    """
+    addon = {
+        "chunker": {
+            "chunk_token_size": 1200,
+            "fixed_token": {"chunk_overlap_token_size": 100},
+        }
+    }
+    client, captured = _make_client(monkeypatch, addon_params=addon)
+    resp = client.post(path, headers=_HEADERS, json=body)
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    # Wrapper applied (fails on the pre-fix bare str(exc)).
+    assert detail.startswith("Invalid chunking configuration:")
+    # Useful validation info preserved.
+    assert "chunk_overlap_token_size" in detail
+    # No raw-exception / infrastructure text leaks into the body.
+    lowered = detail.lower()
+    for marker in ("traceback", " object at 0x", "/users/", "/app/", ".py", "errno"):
+        assert marker not in lowered, f"leaked marker {marker!r} in 422 detail"
     # Rejected synchronously: background indexing never scheduled.
     assert captured == {}
 
@@ -633,23 +1031,38 @@ def test_insert_text_rejects_amount_over_100_inheriting_percentile_type(monkeypa
     assert captured == {}
 
 
-def test_insert_text_rejects_malformed_sentence_split_regex(monkeypatch):
-    # Malformed regex must 422 at request parse time, before scheduling.
+@pytest.mark.parametrize("endpoint", ["/documents/text", "/documents/texts"])
+def test_insert_text_rejects_redos_sentence_split_regex(monkeypatch, endpoint):
+    """GHSA-32jh-39m7-8x84 regression: the ReDoS payload must never be scheduled.
+
+    ``(a+)+$`` against the body text backtracks exponentially, and CPython's
+    regex engine holds the GIL throughout, so reaching the chunker at all
+    freezes the whole worker process — the ``asyncio.to_thread`` hop does not
+    isolate it. The request therefore has to die during parsing: a 422 alone is
+    not enough, ``captured == {}`` (no background task scheduled) is the
+    property that actually closes the hole.
+
+    Both endpoints share ``TextChunkingConfig``, so both are covered here.
+    """
     client, captured = _make_client(monkeypatch)
-    resp = client.post(
-        "/documents/text",
-        headers=_HEADERS,
-        json={
-            "text": "hello",
-            "file_source": "a.md",
-            "chunking": {
-                "strategy": "semantic_vector",
-                "params": {"sentence_split_regex": "("},
-            },
-        },
+    chunking = {
+        "strategy": "semantic_vector",
+        "params": {"sentence_split_regex": "(a+)+$"},
+    }
+    payload = (
+        {"text": "a" * 40 + "!", "file_source": "a.md", "chunking": chunking}
+        if endpoint == "/documents/text"
+        else {
+            "texts": ["a" * 40 + "!"],
+            "file_sources": ["a.md"],
+            "chunking": chunking,
+        }
     )
+    resp = client.post(endpoint, headers=_HEADERS, json=payload)
     assert resp.status_code == 422
     assert captured == {}
+    # The 422 must name the offending key so callers can find the env knob.
+    assert "sentence_split_regex" in str(resp.json()["detail"])
 
 
 def test_insert_text_drops_explicit_null_param(monkeypatch):

@@ -81,7 +81,7 @@ inputs/space1/__parsed__/<规范文件名>.parsed/
 | `doc_title` | `str` | 文档标题（通常为首个 H1）；可选。docx smart_heading 模式下为 LLM 识别的标题块主标题，未识别出标题块时为空字符串 |
 | `doc_summary` | `str` | 文档摘要；可选 |
 | `doc_attributes` | `object` | 文章扩展属性对象；可选 |
-| `bbox_attributes` | `object` | bbox possition全局属性；详见[§八](八、positions) |
+| `bbox_attributes` | `object` | bbox possition全局属性；详见[§八](#八positions) |
 
 > LightRAG要求同一个workspace（知识库）内的文件名（document_name）必须唯一。
 
@@ -121,7 +121,7 @@ inputs/space1/__parsed__/<规范文件名>.parsed/
 | `session_type` | Block所处区域：`body` `preface` `TOC` `references` `appendix` |
 | `table_slice` | 可选保留字段；表示Block是否仅包括表格片段。目前分析引擎不会拆分长表格。因此本字段固定为 `"none"`（表示表格不会被分片） |
 | `table_header` | 可选保留字段；在当前块位表格片段的时候，保存识别出来的表格头。目前不存在 |
-| `positions` | `position` 对象数组：标识文本块的版面位置；文本块来与版面的多个位置的时候，则会出现多个`position` 对象。参见[§八](#八、position) |
+| `positions` | `position` 对象数组：标识文本块的版面位置；文本块来与版面的多个位置的时候，则会出现多个`position` 对象。参见[§八](#八positions) |
 
 > - blockid计算方式：`md5(doc_id + ":" + block_index + ":" + heading + ":" + content)`。文档经过分块策略处理得到的 chunk 将保存 blockid 用于溯源 chunk 在s idecar 中的位置。
 > - 不关系文档章节结构的分块策略 `F` `R` `V` 使用的就是 content 字段拼接后的内容进行分块。因此需要保证所有 Block 的 content字段合并在一起能够构成完整的文档内容，不会缺少内容，不会出现重叠的内容。
@@ -133,7 +133,7 @@ inputs/space1/__parsed__/<规范文件名>.parsed/
 | 标签 | 含义 | 标签属性 |
 |---|---|---|
 | `<table id="tb-…" format="json">…</table>` | 表格占位，包体是表格原始 JSON / HTML | `id` 指向 `tables.json` 里对应 item；`format` ∈ `json` / `html` |
-| `<drawing id="im-…" format="png" path="…" src="…" caption="…" />` | 自闭合图形占位 | `id` 指向 `drawings.json`；`path` 相对 `*.parsed/` 目录；`src` 是原文档里的引用名 |
+| `<drawing id="im-…" format="png" path="…" src="…" caption="…" />` | 自闭合图形占位 | `id` 指向 `drawings.json`；`path` 相对 `*.parsed/` 目录——图片字节未落地时（外链未下载 / 下载失败）为空串 `""`；`src` 是原文档中的原始引用（远程 URL、外链 target） |
 | `<equation id="eq-…" format="latex" caption="…">…</equation>` | 公式占位 | 行内公式同样用 `<equation format="latex">` 但**不**带 `id`，不会进 sidecar； 仅块公式（独占一行或多行）时携带 `id` |
 
 在实体关系抽取的时候喂给大模型的文本会把 `id / path / src` 等内部属性剥掉，但为保留键属性（`format / caption`）。目的是避免抽取出文章不可见的实体，给抽取结果注入过多的噪声。
@@ -192,14 +192,14 @@ inputs/space1/__parsed__/<规范文件名>.parsed/
 | `heading` | 所在章节标题 |
 | `parent_headings` | 字符串数组：自顶向下的祖先标题列表，不含当前 `heading`（与该图形所属 block 在 `blocks.jsonl` 中的同名字段一致） |
 | `format` | 原始扩展名（去点）：`png` / `jpeg` / `gif` / `webp` / `wmf` / `emf` / … |
-| `path` | 相对 `*.parsed/` 目录的资源路径，**永远**指向 `*.blocks.assets/` 内文件 |
-| `src` | 原文档里图形的引用别名（多数情况下为空） |
+| `path` | 相对 `*.parsed/` 目录的资源路径，非空时**永远**指向 `*.blocks.assets/` 内文件；空串 `""` ⇒ 图片字节未缓存到本地（外链未下载 / 下载失败） |
+| `src` | 原文档中图形的原始引用（远程 URL、外链 target）；多数情况下为空 |
 | `caption` | 可见标题（解析器可能留空） |
 | `footnotes` | 脚注字符串列表 |
-| `surrounding` | 上下文对象：参见[§七](#七、surrounding) |
+| `surrounding` | 上下文对象：参见[§七](#七surrounding) |
 | `self_ref` | 字符串：可选；解析引擎原始输出中的对象引用（如 Docling JSON Pointer `#/pictures/3`，或 MinerU `content_list.json#/23`），用于溯源时回查原始解析产物中的对应对象（页面位置、原始结构等）。native 等不提供此字段时不输出 |
 | `extras` | 对象：可选；引擎专属的旁路字段（如图片中包含的OCR文字等）。不属于 spec 校验范围，下游消费者不应依赖具体键。 |
-| `llm_analyze_result` | 模态分析结果对象：详见 [§九](#九、`llm_analyze_result`) （后续会注入到多模态文本块） |
+| `llm_analyze_result` | 模态分析结果对象：详见 [§九](#九llm_analyze_result) （后续会注入到多模态文本块） |
 | `llm_cache_list` | 模态分析LLM缓存数组（后续会注入到多模态文本块） |
 
 `extras` 中常见的 drawing 专属键：

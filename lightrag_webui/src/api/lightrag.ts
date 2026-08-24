@@ -1,5 +1,6 @@
 import axios, { AxiosError } from 'axios'
 import { backendBaseUrl, popularLabelsDefaultLimit, searchLabelsDefaultLimit } from '@/lib/constants'
+import type { SupportedFileTypes } from '@/lib/fileTypes'
 import { errorMessage } from '@/lib/utils'
 import { useSettingsStore } from '@/stores/settings'
 import { useAuthStore } from '@/stores/state'
@@ -123,6 +124,10 @@ export type LightragStatus = {
   update_status?: Record<string, any>
   core_version?: string
   api_version?: string
+  webui_available?: boolean
+  /** Whether /docs, /redoc and /openapi.json are served. Absent on older
+   * backends, which always expose them (see apiDocsCapability in state.ts). */
+  api_docs_available?: boolean
   auth_mode?: 'enabled' | 'disabled'
   server_mode?: 'uvicorn' | 'gunicorn'
   workers?: number
@@ -149,14 +154,6 @@ export type LightragStatus = {
   }
   webui_title?: string
   webui_description?: string
-}
-
-export type LightragDocumentsScanProgress = {
-  is_scanning: boolean
-  current_file: string
-  indexed_count: number
-  total_files: number
-  progress: number
 }
 
 /**
@@ -336,14 +333,12 @@ export type AuthStatusResponse = {
 }
 
 export type PipelineStatusResponse = {
-  autoscanned: boolean
   busy: boolean
   job_name: string
   job_start?: string
   docs: number
   batchs: number
   cur_batch: number
-  request_pending: boolean
   cancellation_requested?: boolean
   latest_message: string
   history_messages?: string[]
@@ -579,6 +574,11 @@ export const getDocuments = async (): Promise<DocsStatusesResponse> => {
   return response.data
 }
 
+export const getSupportedFileTypes = async (signal?: AbortSignal): Promise<SupportedFileTypes> => {
+  const response = await axiosInstance.get('/documents/supported_file_types', { signal })
+  return response.data
+}
+
 export const scanNewDocuments = async (): Promise<ScanResponse> => {
   const response = await axiosInstance.post('/documents/scan')
   return response.data
@@ -586,11 +586,6 @@ export const scanNewDocuments = async (): Promise<ScanResponse> => {
 
 export const reprocessFailedDocuments = async (): Promise<ReprocessFailedResponse> => {
   const response = await axiosInstance.post('/documents/reprocess_failed')
-  return response.data
-}
-
-export const getDocumentsScanProgress = async (): Promise<LightragDocumentsScanProgress> => {
-  const response = await axiosInstance.get('/documents/scan-progress')
   return response.data
 }
 

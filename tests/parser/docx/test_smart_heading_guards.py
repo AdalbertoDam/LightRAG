@@ -1,14 +1,12 @@
 """G5 defensive-judgment tests: strong-body features, homophone vetoes, P3.
 
 Positive-path cases need the real pinned spaCy models (installed in dev via
-``lightrag-download-cache --spacy --spacy-install``); they skip when the
+``lightrag-download-cache --spacy-install``); they skip when the
 models are absent (e.g. a bare CI). The missing-model hard-error contract
 (G12-1) is tested with mocks and always runs.
 """
 
 from __future__ import annotations
-
-import importlib.util
 
 import pytest
 
@@ -17,20 +15,7 @@ from lightrag.parser.docx.smart_heading.style_key import classify_numbering
 pytestmark = pytest.mark.offline
 
 
-def _models_available() -> bool:
-    if importlib.util.find_spec("spacy") is None:
-        return False
-    import spacy.util
-
-    return spacy.util.is_package("zh_core_web_sm") and spacy.util.is_package(
-        "en_core_web_sm"
-    )
-
-
-requires_models = pytest.mark.skipif(
-    not _models_available(),
-    reason="pinned spaCy models not installed (lightrag-download-cache --spacy)",
-)
+requires_models = pytest.mark.requires_spacy_models
 
 
 # route_language is a pure function (no model load), so it always runs.
@@ -486,6 +471,65 @@ def test_is_symbolic_line(text: str, expected: bool) -> None:
     from lightrag.parser.docx.smart_heading.guardrails import is_symbolic_line
 
     assert is_symbolic_line(text) is expected
+
+
+def _centered(pad_em: float, alignment: str | None = "center"):
+    from lightrag.parser.docx.parse_document import ParagraphRecord
+
+    return ParagraphRecord(
+        kind="para",
+        text="某某市科学技术局",
+        alignment=alignment,
+        leading_pad_em=pad_em,
+    )
+
+
+@pytest.mark.parametrize(
+    "alignment,pad_relative_to_budget,expected",
+    [
+        ("center", -4.0, True),  # the ordinary centered title (pad 0 territory)
+        ("center", -0.1, True),  # padded, but still inside the budget
+        ("center", 0.0, False),  # at the budget: no longer visually centered
+        ("center", +10.0, False),  # the 空格排版 signature, far past it
+        ("both", +10.0, False),  # justified: never centered, pad irrelevant
+        ("left", -4.0, False),
+        (None, -4.0, False),  # no w:jc anywhere in the cascade
+    ],
+)
+def test_is_visually_centered(alignment, pad_relative_to_budget, expected) -> None:
+    """``w:jc=center`` plus a wide leading space pad renders right-of-center —
+    the 落款/署名 shape — so it must not count as centered.
+
+    Pads are expressed RELATIVE to the budget so tuning
+    ``CENTER_MAX_LEADING_PAD_EM`` does not invalidate the cases.
+    """
+    from lightrag.parser.docx.smart_heading import guardrails
+
+    pad = guardrails.CENTER_MAX_LEADING_PAD_EM + pad_relative_to_budget
+    rec = _centered(pad, alignment)
+    assert guardrails.is_visually_centered(rec) is expected
+
+
+def test_trailing_heavier_pad_stays_centered() -> None:
+    """A negative net pad (more trailing than leading whitespace) can never
+    trip the rule: Word drops trailing whitespace at a line end, so no
+    rightward shift is claimed for it."""
+    from lightrag.parser.docx.smart_heading import guardrails
+
+    assert guardrails.is_visually_centered(_centered(-20.0)) is True
+
+
+def test_center_pad_budget_is_one_live_constant(monkeypatch) -> None:
+    """The threshold is a single named constant read at call time, so tuning it
+    needs no other edit."""
+    from lightrag.parser.docx.smart_heading import guardrails
+
+    rec = _centered(guardrails.CENTER_MAX_LEADING_PAD_EM + 1.0)
+    assert guardrails.is_visually_centered(rec) is False
+    monkeypatch.setattr(
+        guardrails, "CENTER_MAX_LEADING_PAD_EM", rec.leading_pad_em + 1.0
+    )
+    assert guardrails.is_visually_centered(rec) is True
 
 
 # ---------------------------------------------------------------------------

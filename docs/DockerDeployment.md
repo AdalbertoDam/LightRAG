@@ -250,11 +250,11 @@ This keeps generated host mounts under the same `./data` root used by the defaul
 
 ### PostgreSQL image
 
-The interactive setup defaults PostgreSQL to `gzdaniel/postgres-for-rag:pg18-age-pgvector`. This image bundles both Apache AGE and pgvector so the generated stack works with `PGGraphStorage` and `PGVectorStorage` without extra extension setup.
+The interactive setup defaults PostgreSQL to `gzdaniel/postgres-for-rag:pg18-age-pgvector`. This image bundles both Apache AGE and pgvector so the generated stack works with `PGGraphStorage` and `PGVectorStorage` without extra extension setup. The published tag is a multi-architecture manifest covering `linux/amd64` and `linux/arm64`.
 
 The image no longer ships fixed credentials; on first start it creates the user, password, and database from the `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` environment variables. The setup wizard prompts for these values (defaulting to `rag` / `rag` / `lightrag`) and injects them into the generated `docker-compose.final.yml`, so you can choose any user, password, and database name.
 
-**Important Note**: If PGGraphStorage is not required for vector storage, you may replace the upper docker image with the latest official pgvector image `pgvector/pgvector:pg18`. Please note that data file formats are incompatible across different PostgreSQL major versions; once this Docker image is deployed, it cannot be rolled back to a previous version.
+**Prefer the official pgvector image when you don't need AGE**: Apache AGE is required only by `PGGraphStorage`. The recommended PostgreSQL graph storage is `PGTableGraphStorage`, which keeps the entity-relation graph in ordinary indexed tables and needs no extension at all — so if graph storage is `PGTableGraphStorage` (or lives on another backend such as Neo4j entirely), replace the image above with the latest official pgvector image `pgvector/pgvector:pg18`. Only `PGGraphStorage` still requires the AGE-bundled image. Please note that data file formats are incompatible across different PostgreSQL major versions; once this Docker image is deployed, it cannot be rolled back to a previous version.
 
 #### Build the PostgreSQL image
 
@@ -303,7 +303,7 @@ docker compose up
 
 Software packages requiring `transformers`, `torch`, or `cuda` are not preinstalled in the docker images. Consequently, document extraction tools such as Docling, as well as local LLM models like Hugging Face and LMDeploy, cannot be used in an offline environment. These high-compute-resource-demanding services should not be integrated into LightRAG. Docling will be decoupled and deployed as a standalone service.
 
-The main image bundles everything the native docx parser's opt-in `smart_heading` engine parameter needs: the spaCy runtime plus the pinned `zh_core_web_sm` / `en_core_web_sm` 3.8.0 models are baked in at build time, so `smart_heading` works fully offline out of the box. The lite image ships the spaCy runtime (it comes with the `api` extra) but not the models — enabling `smart_heading` there requires installing them first (`lightrag-download-cache --spacy --spacy-install`, or see [OfflineDeployment.md](./OfflineDeployment.md) for air-gapped hosts).
+The main image bundles everything the native docx parser's opt-in `smart_heading` engine parameter needs: the spaCy runtime plus the pinned `zh_core_web_sm` / `en_core_web_sm` 3.8.0 models are baked in at build time, so `smart_heading` works fully offline out of the box. The lite image ships the spaCy runtime (it comes with the `api` extra) but not the models — enabling `smart_heading` there requires installing them first (`lightrag-download-cache --spacy-install`, or see [OfflineDeployment.md](./OfflineDeployment.md) for air-gapped hosts).
 
 ## 📦 Build Docker Images
 

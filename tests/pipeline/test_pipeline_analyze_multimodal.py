@@ -33,8 +33,12 @@ import numpy as np
 import pytest
 
 from lightrag import LightRAG, ROLES, RoleLLMConfig
-from lightrag.exceptions import MultimodalAnalysisError
-from lightrag.utils import EmbeddingFunc, Tokenizer
+from lightrag.exceptions import MultimodalAnalysisError, PipelineCancelledException
+from lightrag.utils import (
+    EmbeddingFunc,
+    LLM_TRUNCATION_METADATA_KEY,
+    Tokenizer,
+)
 
 
 @pytest.fixture
@@ -633,16 +637,53 @@ async def test_invalid_vlm_response_hard_fails(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_table_extract_json_conformance_retry_succeeds(tmp_path):
-    """Table analysis uses the EXTRACT role and retries once when the JSON
-    object is valid but missing required schema fields."""
+@pytest.mark.parametrize(
+    "first_response",
+    [
+        json.dumps({"description": "missing name"}),
+        json.dumps(
+            [
+                {"name": "first", "description": "first result"},
+                {"name": "second", "description": "second result"},
+            ]
+        ),
+        "Here is the result: "
+        + json.dumps(
+            [
+                {"name": "first", "description": "first result"},
+                {"name": "second", "description": "second result"},
+            ]
+        ),
+        json.dumps(
+            [
+                {"name": "first", "description": "first result"},
+                {"name": "second", "description": "second result"},
+            ]
+        )[:-1],
+        "['note', {'name':'first','description':'first result'}]",
+        '[/* note */ {"name":"first","description":"first result"}]',
+        '[/* ] */ {"name":"first","description":"first result"}]',
+    ],
+    ids=[
+        "missing-required-field",
+        "top-level-array",
+        "prose-prefixed-top-level-array",
+        "truncated-top-level-array",
+        "repairable-leading-element-array",
+        "commented-top-level-array",
+        "bracket-in-comment-array",
+    ],
+)
+async def test_table_extract_json_conformance_retry_succeeds(tmp_path, first_response):
+    """Table analysis retries once for invalid JSON object conformance
+    (missing required field, or any top-level array shape)."""
     extract_log: list[dict] = []
     vlm_log: list[dict] = []
 
     async def extract_func(prompt, **kwargs):
         extract_log.append({"prompt": prompt, "kwargs": dict(kwargs)})
         if len(extract_log) == 1:
-            return json.dumps({"description": "missing name"})
+            return first_response
         return json.dumps(
             {
                 "name": "retry-table",
@@ -796,18 +837,189 @@ async def test_table_routes_to_extract_role_not_vlm(tmp_path):
         await rag.finalize_storages()
 
 
+def _write_equation_fixture(tmp_path: Path, latex: str) -> tuple[str, dict, Path]:
+    """Write a minimal equation sidecar fixture and return (doc_id, parsed_data, path)."""
+    parsed_dir = tmp_path / "parsed"
+    parsed_dir.mkdir()
+    blocks_path = parsed_dir / "doc.blocks.jsonl"
+    blocks_path.write_text(
+        json.dumps({"type": "meta", "doc_id": "doc-1"}) + "\n",
+        encoding="utf-8",
+    )
+    equations_path = parsed_dir / "doc.equations.json"
+    equations_path.write_text(
+        json.dumps(
+            {
+                "equations": {
+                    "eq-001": {
+                        "id": "eq-001",
+                        "blockid": "blk-1",
+                        "heading": "",
+                        "parent_headings": [],
+                        "format": "latex",
+                        "content": latex,
+                        "caption": "",
+                        "footnotes": [],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return "doc-1", {"blocks_path": str(blocks_path)}, equations_path
+
+
 @pytest.mark.asyncio
-async def test_invalid_json_with_trailing_comma_is_repaired(tmp_path):
-    """Slightly malformed VLM JSON (trailing comma) must be repaired via
-    ``json_repair`` instead of hard-failing the document — mirrors the
-    extraction-side repair contract in operate._process_json_extraction_result.
-    """
+async def test_equation_omitted_field_falls_back_to_sidecar_latex(
+    tmp_path, caplog, _propagate_lightrag_logger
+):
+    """Regression #3502: when the model omits the `equation` field entirely,
+    the analysis must fall back to the sidecar's authoritative LaTeX instead
+    of aborting the whole document — and must say so in the log, since the
+    fallback silently trades the prompt-mandated normalization for source
+    LaTeX and no conformance retry fires any more."""
+    extract_log: list[dict] = []
+
+    async def extract_func(prompt, **kwargs):
+        extract_log.append({"prompt": prompt, "kwargs": dict(kwargs)})
+        # Model returns valid name/description but omits `equation` entirely.
+        return json.dumps(
+            {
+                "name": "sample-quantile",
+                "description": "Defines the p-th sample quantile.",
+            }
+        )
+
+    rag = _build_rag(
+        tmp_path,
+        vlm_process_enable=True,
+        vlm_func=_make_vlm_mock([]),
+        extract_func=extract_func,
+    )
+    await rag.initialize_storages()
+    try:
+        sidecar_latex = r"x_p = \left\{ \begin{array}{ll} x_{(k)} & \text{if } p = k \end{array} \right."
+        doc_id, parsed_data, equations_path = _write_equation_fixture(
+            tmp_path, sidecar_latex
+        )
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="lightrag"):
+            await rag.analyze_multimodal(
+                doc_id=doc_id,
+                file_path="fixture.pdf",
+                parsed_data=parsed_data,
+                process_options="e",
+            )
+        assert len(extract_log) == 1
+        payload = json.loads(equations_path.read_text(encoding="utf-8"))
+        result = payload["equations"]["eq-001"]["llm_analyze_result"]
+        assert result["status"] == "success"
+        assert result["name"] == "sample-quantile"
+        # The equation field must be recovered from the sidecar LaTeX.
+        assert result["equation"] == sidecar_latex
+        # Operators must be able to see that their model returns off-schema
+        # JSON: the fallback is the only remaining signal (the JSON
+        # conformance retry no longer fires for this response).
+        assert [
+            r
+            for r in caplog.records
+            if "equation/eq-001" in r.getMessage()
+            and "unnormalized source LaTeX" in r.getMessage()
+        ]
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_equation_equ_alias_accepted(
+    tmp_path, caplog, _propagate_lightrag_logger
+):
+    """Regression #3502: when the model returns the equation under a
+    semantically equivalent key such as `equ`, it must be accepted (and
+    logged — an accepted alias shadows the sidecar's authoritative LaTeX)."""
+    extract_log: list[dict] = []
+
+    async def extract_func(prompt, **kwargs):
+        extract_log.append({"prompt": prompt, "kwargs": dict(kwargs)})
+        # Model returns the equation under the alias key `equ`.
+        return json.dumps(
+            {
+                "name": "sample-quantile",
+                "description": "Defines the p-th sample quantile.",
+                "equ": r"x_p = x_{(k)}",
+            }
+        )
+
+    rag = _build_rag(
+        tmp_path,
+        vlm_process_enable=True,
+        vlm_func=_make_vlm_mock([]),
+        extract_func=extract_func,
+    )
+    await rag.initialize_storages()
+    try:
+        sidecar_latex = r"x_p = \left\{ \begin{array}{ll} x_{(k)} \end{array} \right."
+        doc_id, parsed_data, equations_path = _write_equation_fixture(
+            tmp_path, sidecar_latex
+        )
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="lightrag"):
+            await rag.analyze_multimodal(
+                doc_id=doc_id,
+                file_path="fixture.pdf",
+                parsed_data=parsed_data,
+                process_options="e",
+            )
+        assert len(extract_log) == 1
+        payload = json.loads(equations_path.read_text(encoding="utf-8"))
+        result = payload["equations"]["eq-001"]["llm_analyze_result"]
+        assert result["status"] == "success"
+        # The `equ` alias value is used (preferred over the sidecar fallback).
+        assert result["equation"] == r"x_p = x_{(k)}"
+        assert [
+            r
+            for r in caplog.records
+            if "equation/eq-001" in r.getMessage()
+            and "off-schema key 'equ'" in r.getMessage()
+        ]
+        # The sidecar fallback must NOT be reported when the alias supplied a
+        # usable body.
+        assert not [
+            r for r in caplog.records if "unnormalized source LaTeX" in r.getMessage()
+        ]
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        '{"name": "fig-1", "type": "Chart", "description": "ok",}',
+        'Source: http://example {"name":"fig-1","type":"Chart","description":"ok"}',
+        'Here\'s the result: {"name":"fig-1","type":"Chart","description":"ok"} trailing {brace}',
+        'Result #1: {"name":"fig-1","type":"Chart","description":"ok"}',
+        'Note // result: {"name":"fig-1","type":"Chart","description":"ok"}',
+    ],
+    ids=[
+        "trailing-comma",
+        "prose-url-prefix",
+        "prose-apostrophe-prefix",
+        "prose-hash-prefix",
+        "prose-slash-prefix",
+    ],
+)
+async def test_repairable_json_is_accepted_without_retry(tmp_path, response):
+    """Repairable / prose-wrapped VLM JSON must not unnecessarily trigger a
+    conformance retry — mirrors the extraction-side recovery contract in
+    operate._process_json_extraction_result."""
     call_log: list[dict] = []
 
     async def vlm_func(prompt, **kwargs):
         call_log.append({"prompt": prompt, "kwargs": dict(kwargs)})
-        # Trailing comma after "description" — strict json.loads would reject.
-        return '{"name": "fig-1", "type": "Chart", "description": "ok",}'
+        return response
 
     rag = _build_rag(tmp_path, vlm_process_enable=True, vlm_func=vlm_func)
     await rag.initialize_storages()
@@ -1212,6 +1424,184 @@ async def test_extract_cap_below_prompt_frame_fails_item_without_llm_call(
         await rag.finalize_storages()
 
 
+@pytest.mark.asyncio
+async def test_content_budget_below_floor_fails_item_without_llm_call(
+    tmp_path, monkeypatch
+):
+    """A *positive* content budget that still falls below
+    ``MM_EXTRACT_CONTENT_MIN_TOKENS`` must fail the item without an LLM call.
+
+    Distinct from the ``content_budget <= 0`` case: here the frame fits and
+    some room remains, but too little to ground a useful analysis — trimming
+    would hand the LLM a near-empty stub.  The cap (8000) sits comfortably
+    above the ~4k-char template frame so ``content_budget`` (~3.7k) is
+    positive, while the floor is raised to 7000 so that budget lands *below*
+    it, isolating the new guard from the non-positive-budget path.
+    """
+    monkeypatch.setenv("MAX_EXTRACT_INPUT_TOKENS", "8000")
+    monkeypatch.setenv("MM_EXTRACT_CONTENT_MIN_TOKENS", "7000")
+
+    extract_log: list[dict] = []
+    rag = _build_rag(
+        tmp_path,
+        vlm_process_enable=False,
+        extract_func=_make_extract_mock(extract_log),
+    )
+    await rag.initialize_storages()
+    try:
+        parsed_dir = tmp_path / "parsed"
+        parsed_dir.mkdir()
+        blocks_path = parsed_dir / "doc.blocks.jsonl"
+        blocks_path.write_text(
+            json.dumps({"type": "meta", "doc_id": "doc-floor"}) + "\n",
+            encoding="utf-8",
+        )
+        # Big enough that the full prompt exceeds the 8000 cap so the budget
+        # path engages.
+        rows = [[f"r{i}c0", f"r{i}c1"] for i in range(800)]
+        big_table = (
+            '<table id="tb-floor" format="json">' + json.dumps(rows) + "</table>"
+        )
+        assert len(rag.tokenizer.encode(big_table)) > 8000
+
+        tables_path = parsed_dir / "doc.tables.json"
+        tables_path.write_text(
+            json.dumps(
+                {"tables": {"tb-floor": {"format": "json", "content": big_table}}}
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(MultimodalAnalysisError) as excinfo:
+            await rag.analyze_multimodal(
+                doc_id="doc-floor",
+                file_path="fixture.pdf",
+                parsed_data={"blocks_path": str(blocks_path)},
+                process_options="t",
+            )
+
+        # No LLM call — we refused to send a meaningless stub.
+        assert extract_log == [], (
+            f"EXTRACT must not be called when content budget is below the "
+            f"floor; got {len(extract_log)} call(s)"
+        )
+
+        msg = str(excinfo.value)
+        assert "table/tb-floor" in msg
+        assert "content budget" in msg
+        assert "7000" in msg  # the configured floor
+        assert "MM_EXTRACT_CONTENT_MIN_TOKENS" in msg
+
+        # Sidecar records status=failure so operators can re-run after
+        # widening the budget.
+        payload = json.loads(tables_path.read_text(encoding="utf-8"))
+        item = payload["tables"]["tb-floor"]
+        assert item["llm_analyze_result"]["status"] == "failure"
+        assert "content budget" in item["llm_analyze_result"]["message"]
+    finally:
+        await rag.finalize_storages()
+
+
+def test_structurally_starved_config_warns_once(caplog, _propagate_lightrag_logger):
+    """``_warn_content_budget_structurally_starved`` emits a single WARNING
+    per unique config, and stays silent for a comfortable config."""
+    from lightrag.pipeline import _warn_content_budget_structurally_starved
+
+    # SURROUNDING caps (2000+2000) + reserve alone overrun a 3000 cap → warn,
+    # and only once despite repeated calls (lru_cache on the config tuple).
+    _warn_content_budget_structurally_starved.cache_clear()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="lightrag"):
+        for _ in range(3):
+            _warn_content_budget_structurally_starved(
+                max_extract=3000,
+                leading_cap=2000,
+                trailing_cap=2000,
+                frame_reserve=256,
+                content_min=100,
+            )
+    starved = [
+        r
+        for r in caplog.records
+        if "leaves only" in r.getMessage()
+        and "MAX_EXTRACT_INPUT_TOKENS=3000" in r.getMessage()
+    ]
+    assert len(starved) == 1, "must fire exactly once despite repeats"
+
+    # A comfortable cap leaves ample room → no warning at all.
+    _warn_content_budget_structurally_starved.cache_clear()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="lightrag"):
+        _warn_content_budget_structurally_starved(
+            max_extract=20480,
+            leading_cap=2000,
+            trailing_cap=2000,
+            frame_reserve=256,
+            content_min=100,
+        )
+    assert not [r for r in caplog.records if "leaves only" in r.getMessage()]
+
+
+@pytest.mark.asyncio
+async def test_cap_disabled_skips_starvation_warning_and_analyzes(
+    tmp_path, caplog, _propagate_lightrag_logger, monkeypatch
+):
+    """``MAX_EXTRACT_INPUT_TOKENS=0`` opts out of the input cap: enforcement is
+    bypassed, so the structural-starvation warning must NOT fire (it would be
+    false — no item can fail) and analysis proceeds uncapped.
+
+    With the default SURROUNDING caps (2000 + 2000) the config would look
+    "starved" (static room < floor); the guard hinges on the cap being
+    disabled, not on the caps looking healthy.
+    """
+    monkeypatch.setenv("MAX_EXTRACT_INPUT_TOKENS", "0")
+
+    extract_log: list[dict] = []
+    rag = _build_rag(
+        tmp_path,
+        vlm_process_enable=False,
+        extract_func=_make_extract_mock(extract_log),
+    )
+    await rag.initialize_storages()
+    try:
+        parsed_dir = tmp_path / "parsed"
+        parsed_dir.mkdir()
+        blocks_path = parsed_dir / "doc.blocks.jsonl"
+        blocks_path.write_text(
+            json.dumps({"type": "meta", "doc_id": "doc-uncapped"}) + "\n",
+            encoding="utf-8",
+        )
+        table = '<table id="tb-uncapped" format="json">[["A","B"],["c","d"]]</table>'
+        tables_path = parsed_dir / "doc.tables.json"
+        tables_path.write_text(
+            json.dumps(
+                {"tables": {"tb-uncapped": {"format": "json", "content": table}}}
+            ),
+            encoding="utf-8",
+        )
+
+        with caplog.at_level(logging.WARNING, logger="lightrag"):
+            await rag.analyze_multimodal(
+                doc_id="doc-uncapped",
+                file_path="fixture.pdf",
+                parsed_data={"blocks_path": str(blocks_path)},
+                process_options="t",
+            )
+
+        # No false starvation warning for the disabled cap.
+        assert not [r for r in caplog.records if "leaves only" in r.getMessage()], (
+            "starvation warning must not fire when the cap is disabled"
+        )
+
+        # Analysis proceeds uncapped: the LLM was called and the item succeeded.
+        assert len(extract_log) == 1
+        payload = json.loads(tables_path.read_text(encoding="utf-8"))
+        item = payload["tables"]["tb-uncapped"]
+        assert item["llm_analyze_result"]["status"] == "success"
+    finally:
+        await rag.finalize_storages()
+
+
 # ---------------------------------------------------------------------------
 # Table content-format declaration (prompt tells the LLM html vs json).
 # ---------------------------------------------------------------------------
@@ -1309,3 +1699,342 @@ async def test_table_missing_format_hard_fails(tmp_path):
             content="<table><tr><td>A</td></tr></table>",
         )
     assert "tb-001" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_truncated_vlm_response_not_cached_and_recomputed(tmp_path):
+    """A token-limit-truncated VLM analysis is used but never cached.
+
+    Even when the truncated payload still parses as valid analysis JSON, the
+    cache write must be skipped (no entry, no ``llm_cache_list`` write-back)
+    so a later run re-invokes the VLM instead of replaying the partial result.
+    """
+    from lightrag.utils import TruncatedResponse
+
+    call_log: list[int] = []
+
+    async def truncated_vlm(prompt, **kwargs):
+        call_log.append(1)
+        return TruncatedResponse(
+            json.dumps(
+                {
+                    "name": "fig-1",
+                    "type": "Chart",
+                    "description": "partial but parseable description",
+                }
+            )
+        )
+
+    rag = _build_rag(tmp_path, vlm_process_enable=True, vlm_func=truncated_vlm)
+    await rag.initialize_storages()
+    try:
+        doc_id, parsed_data, sidecar_path = _write_sidecar_fixtures(tmp_path)
+
+        await rag.analyze_multimodal(
+            doc_id=doc_id,
+            file_path="fixture.pdf",
+            parsed_data=parsed_data,
+            process_options="i",
+        )
+        assert len(call_log) == 1
+
+        # The salvaged partial analysis is still used for this run...
+        payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        item = payload["drawings"]["im-001"]
+        assert item["llm_analyze_result"]["status"] == "success"
+        # ...but no cache entry exists and no cache id was written back.
+        assert not item.get("llm_cache_list")
+        cache_file = (
+            Path(rag.working_dir) / rag.workspace / "kv_store_llm_response_cache.json"
+        )
+        if cache_file.exists():
+            cache_blob = json.loads(cache_file.read_text(encoding="utf-8"))
+            assert not [
+                k for k in cache_blob.keys() if k.startswith("default:analysis:")
+            ]
+
+        # Re-run: no cache hit, so the VLM must be invoked again.
+        await rag.analyze_multimodal(
+            doc_id=doc_id,
+            file_path="fixture.pdf",
+            parsed_data=parsed_data,
+            process_options="i",
+        )
+        assert len(call_log) == 2
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_truncated_analysis_is_recorded_on_the_handoff_dict(tmp_path):
+    """Codex review (PR #3607): an accepted-but-truncated analysis feeds a
+    partial description into KG extraction, so it must reach the document's
+    durable metadata — not just the server log. The analyze stage records it
+    on the hand-off dict; the process stage merges it at the terminal write
+    (a doc_status stamp here would die at the PROCESSING transition, the key
+    being per-attempt rather than carried over)."""
+    from lightrag.utils import TruncatedResponse
+
+    async def truncated_vlm(prompt, **kwargs):
+        return TruncatedResponse(
+            json.dumps(
+                {
+                    "name": "fig-1",
+                    "type": "Chart",
+                    "description": "partial but parseable description",
+                }
+            )
+        )
+
+    rag = _build_rag(tmp_path, vlm_process_enable=True, vlm_func=truncated_vlm)
+    await rag.initialize_storages()
+    try:
+        doc_id, parsed_data, _sidecar_path = _write_sidecar_fixtures(tmp_path)
+
+        analyzed = await rag.analyze_multimodal(
+            doc_id=doc_id,
+            file_path="fixture.pdf",
+            parsed_data=parsed_data,
+            process_options="i",
+        )
+
+        summary = analyzed.get("llm_truncation")
+        assert summary is not None, (
+            "an accepted truncated analysis left no record on the hand-off dict"
+        )
+        assert summary["stages"] == {"multimodal": 1}
+        assert summary["samples"] == ["drawings/im-001"]
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_truncation_is_recorded_even_with_the_analysis_cache_disabled(
+    tmp_path, monkeypatch
+):
+    """The old marker check lived inside the cache-write guard, so with
+    enable_llm_cache_for_entity_extract off it never ran at all — the same
+    gap issue #3601 point 3 describes for extraction."""
+    from lightrag.utils import TruncatedResponse
+
+    async def truncated_vlm(prompt, **kwargs):
+        return TruncatedResponse(
+            json.dumps({"name": "f", "type": "Chart", "description": "partial"})
+        )
+
+    rag = _build_rag(tmp_path, vlm_process_enable=True, vlm_func=truncated_vlm)
+    rag.enable_llm_cache_for_entity_extract = False
+    await rag.initialize_storages()
+    try:
+        doc_id, parsed_data, _sidecar_path = _write_sidecar_fixtures(tmp_path)
+
+        analyzed = await rag.analyze_multimodal(
+            doc_id=doc_id,
+            file_path="fixture.pdf",
+            parsed_data=parsed_data,
+            process_options="i",
+        )
+
+        assert analyzed.get("llm_truncation") is not None
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_clean_analysis_leaves_no_truncation_record(tmp_path):
+    async def clean_vlm(prompt, **kwargs):
+        return json.dumps({"name": "fig-1", "type": "Chart", "description": "complete"})
+
+    rag = _build_rag(tmp_path, vlm_process_enable=True, vlm_func=clean_vlm)
+    await rag.initialize_storages()
+    try:
+        doc_id, parsed_data, _sidecar_path = _write_sidecar_fixtures(tmp_path)
+
+        analyzed = await rag.analyze_multimodal(
+            doc_id=doc_id,
+            file_path="fixture.pdf",
+            parsed_data=parsed_data,
+            process_options="i",
+        )
+
+        assert "llm_truncation" not in analyzed
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+async def test_fail_fast_exit_still_hands_over_the_truncation_record(tmp_path):
+    """Codex review (PR #3607): sidecar groups run sequentially, so a drawing
+    whose truncated analysis was accepted (and written to the sidecar) can be
+    followed by a failing table whose fail-fast raise used to skip the
+    success-only hand-off — the recorded event never left the stage. The
+    hand-off must happen on every exit."""
+    from lightrag.utils import TruncatedResponse
+
+    async def truncated_vlm(prompt, **kwargs):
+        return TruncatedResponse(
+            json.dumps(
+                {
+                    "name": "fig-1",
+                    "type": "Chart",
+                    "description": "partial but parseable description",
+                }
+            )
+        )
+
+    rag = _build_rag(tmp_path, vlm_process_enable=True, vlm_func=truncated_vlm)
+    await rag.initialize_storages()
+    try:
+        doc_id, parsed_data, sidecar_path = _write_sidecar_fixtures(tmp_path)
+        # A table with no ``format`` hard-fails deterministically (no LLM
+        # call), AFTER the drawings group has fully completed.
+        (sidecar_path.parent / "doc.tables.json").write_text(
+            json.dumps(
+                {
+                    "tables": {
+                        "tb-001": {
+                            "caption": "Table 1",
+                            "content": "<table><tr><td>A</td></tr></table>",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(MultimodalAnalysisError):
+            await rag.analyze_multimodal(
+                doc_id=doc_id,
+                file_path="fixture.pdf",
+                parsed_data=parsed_data,
+                process_options="it",
+            )
+
+        summary = parsed_data.get("llm_truncation")
+        assert summary is not None, (
+            "the fail-fast exit dropped the accepted truncated analysis: its "
+            "partial result is in the sidecar but the record never left the "
+            "analyze stage"
+        )
+        assert summary["stages"] == {"multimodal": 1}
+        assert summary["samples"] == ["drawings/im-001"]
+        # The accepted partial analysis really did persist.
+        payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        assert payload["drawings"]["im-001"]["llm_analyze_result"]["status"] == (
+            "success"
+        )
+    finally:
+        await rag.finalize_storages()
+
+
+def _make_worker_ctx():
+    import asyncio
+    from lightrag.pipeline import _BatchRunContext
+    from lightrag.parser.registry import parser_specs_snapshot
+
+    return _BatchRunContext(
+        pipeline_status={
+            "latest_message": "",
+            "history_messages": [],
+            "cancellation_requested": False,
+        },
+        pipeline_status_lock=asyncio.Lock(),
+        semaphore=asyncio.Semaphore(1),
+        total_files=1,
+        parse_queues={
+            "native": asyncio.Queue(),
+            "mineru": asyncio.Queue(),
+            "docling": asyncio.Queue(),
+        },
+        parser_specs=parser_specs_snapshot(),
+        q_analyze=asyncio.Queue(),
+        q_process=asyncio.Queue(),
+    )
+
+
+async def _run_analyze_worker_once(rag, ctx, doc_id, status_doc):
+    import asyncio
+
+    worker = asyncio.create_task(rag._analyze_worker(ctx))
+    await ctx.q_analyze.put((doc_id, status_doc, {"content": "body"}))
+    await ctx.q_analyze.join()
+    worker.cancel()
+    try:
+        await worker
+    except asyncio.CancelledError:
+        pass
+
+
+def _pending_status_doc(file_path: str):
+    from lightrag.base import DocProcessingStatus, DocStatus
+
+    return DocProcessingStatus(
+        content_summary="",
+        content_length=0,
+        file_path=file_path,
+        status=DocStatus.PENDING,
+        created_at="2026-05-14T00:00:00Z",
+        updated_at="2026-05-14T00:00:00Z",
+        track_id="t",
+        content_hash="h",
+    )
+
+
+@pytest.mark.parametrize(
+    "raise_exc",
+    [
+        MultimodalAnalysisError("forced failure for test"),
+        PipelineCancelledException("cancelled mid-VLM for test"),
+    ],
+    ids=["fail-fast", "cancelled"],
+)
+@pytest.mark.asyncio
+async def test_analyze_worker_stamps_truncation_on_the_failed_row(tmp_path, raise_exc):
+    """Codex review (PR #3607): a document that fails (or is cancelled) at
+    the analyze stage never reaches the process stage's terminal writes, so
+    the analyze worker's own FAILED transition must stamp the handed-over
+    truncation record — otherwise an accepted truncated analysis whose
+    partial result is already in the sidecar leaves no durable trace."""
+    from dataclasses import asdict
+    from lightrag.base import DocStatus
+
+    async def vlm_func(prompt, **kwargs):
+        return ""
+
+    rag = _build_rag(tmp_path, vlm_process_enable=True, vlm_func=vlm_func)
+    await rag.initialize_storages()
+    try:
+        doc_id = "doc-fail-trunc-1"
+        status_doc = _pending_status_doc("demo.pdf")
+        await rag.doc_status.upsert({doc_id: asdict(status_doc)})
+
+        handed_over = {
+            "events": 1,
+            "affected": 1,
+            "stages": {"multimodal": 1},
+            "samples": ["drawings/im-001"],
+        }
+
+        async def _record_then_raise(**kwargs):
+            # What analyze_multimodal's every-exit finally does: the record
+            # is on the hand-off dict by the time the exception escapes.
+            kwargs["parsed_data"]["llm_truncation"] = dict(handed_over)
+            raise raise_exc
+
+        rag.analyze_multimodal = _record_then_raise  # type: ignore[assignment]
+
+        ctx = _make_worker_ctx()
+        await _run_analyze_worker_once(rag, ctx, doc_id, status_doc)
+
+        refreshed = await rag.doc_status.get_by_id(doc_id)
+        if not isinstance(refreshed, dict):
+            refreshed = asdict(refreshed)
+        assert refreshed["status"] == DocStatus.FAILED
+        record = (refreshed.get("metadata") or {}).get(LLM_TRUNCATION_METADATA_KEY)
+        assert record == handed_over, (
+            "the analyze-stage FAILED transition dropped the truncation "
+            "record handed over by analyze_multimodal"
+        )
+        assert ctx.q_process.empty()
+    finally:
+        await rag.finalize_storages()

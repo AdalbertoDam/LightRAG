@@ -25,6 +25,8 @@ from lightrag.base import DocStatus
 from lightrag.tools.kg_integrity_repair import audit_kg_integrity
 from lightrag.utils import EmbeddingFunc, Tokenizer, compute_mdhash_id
 
+from .conftest import request_failed_retry
+
 pytestmark = pytest.mark.offline
 
 
@@ -212,13 +214,120 @@ async def test_pipeline_failure_then_restart_converges(
     finally:
         await rag1.finalize_storages()
 
-    # ...and after a restart, an ordinary retry converges.
+    # ...and after a restart, an explicit manual retry converges (a FAILED
+    # doc re-enters only via the /reprocess_failed semantics; a doc left
+    # PENDING/interrupted by the crash is picked up automatically either way).
     rag2 = await _build_rag(tmp_path, workspace)
     try:
+        await request_failed_retry(rag2)
         await rag2.apipeline_process_enqueue_documents()
         await _assert_converged(rag2, doc_id)
     finally:
         await rag2.finalize_storages()
+
+
+# Injection points inside the DELETION saga (issue #3400 fail-closed purge).
+# Each is a persistence boundary the journal has to make resumable: purge
+# deletes the recovery anchors last, so any failure at or after that point
+# leaves a document whose anchors are gone, and only the journal can tell the
+# retry that they were removed deliberately rather than never written.
+_DELETE_INJECTION_POINTS = {
+    # Journal write itself: must abort before deleting anything.
+    "purge_journal_write": lambda rag, mp: _fail_once(
+        mp, rag.doc_status, "update_doc_status_fields", "journal write boom"
+    ),
+    "graph_node_removal": lambda rag, mp: _fail_once(
+        mp, rag.chunk_entity_relation_graph, "remove_nodes", "node removal boom"
+    ),
+    "pre_rebuild_flush": lambda rag, mp: _fail_once(
+        mp, rag.entities_vdb, "index_done_callback", "pre-rebuild flush boom"
+    ),
+    "chunk_delete": lambda rag, mp: _fail_once(
+        mp, rag.text_chunks, "delete", "chunk delete boom"
+    ),
+    "chunk_flush": lambda rag, mp: _fail_once(
+        mp, rag.chunks_vdb, "index_done_callback", "chunk flush boom"
+    ),
+    # The window fail-closed would otherwise deadlock on: the first anchor row
+    # is gone, the second delete fails, and a retry must NOT read that as
+    # "this document never had anchors".
+    "second_anchor_delete": lambda rag, mp: _fail_once(
+        mp, rag.full_relations, "delete", "relations anchor delete boom"
+    ),
+    "anchor_flush": lambda rag, mp: _fail_once(
+        mp, rag.full_relations, "index_done_callback", "anchor flush boom"
+    ),
+    # After the purge is fully done, while the caller still has work left.
+    "full_docs_delete": lambda rag, mp: _fail_once(
+        mp, rag.full_docs, "delete", "full_docs delete boom"
+    ),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("injection_point", sorted(_DELETE_INJECTION_POINTS))
+async def test_delete_failure_then_retry_converges(
+    tmp_path, monkeypatch, injection_point
+):
+    """Every deletion boundary must converge on retry, never wedge.
+
+    The failure mode this guards against is specific to failing closed: once
+    purge has removed the anchors, a naive retry sees "anchors missing" and
+    refuses forever, making the document permanently undeletable. Each point
+    below is injected once, then the same delete is retried, and the document
+    must end up either gone or still deletable — but never stuck behind a 409.
+    """
+    workspace = f"fim-del-{uuid4().hex[:8]}"
+    doc_id = compute_mdhash_id("del.txt", prefix="doc-")
+
+    rag = await _build_rag(tmp_path, workspace)
+    try:
+        await rag.apipeline_enqueue_documents(input="delete doc", file_paths="del.txt")
+        await rag.apipeline_process_enqueue_documents()
+        assert _status_text(await rag.doc_status.get_by_id(doc_id)) == (
+            DocStatus.PROCESSED.value
+        )
+
+        _DELETE_INJECTION_POINTS[injection_point](rag, monkeypatch)
+        first = await rag.adelete_by_doc_id(doc_id)
+        assert first.status == "fail", (
+            f"{injection_point}: injected failure did not surface"
+        )
+        # Never a recovery-proof refusal on the FIRST attempt: the anchors were
+        # intact when it started.
+        assert first.status_code != 409, f"{injection_point}: {first.message}"
+
+        monkeypatch.undo()
+        second = await rag.adelete_by_doc_id(doc_id)
+
+        assert second.status_code != 409, (
+            f"{injection_point}: retry refused for want of a recovery proof, "
+            f"so the document is permanently undeletable: {second.message}"
+        )
+        if injection_point == "full_docs_delete":
+            # This is the one point PAST the doc_status deletion, so the retry
+            # finds no status record and reports the document already gone.
+            # That ordering is deliberate and predates this work (see the
+            # comment on the delete_doc_entries step): doc_status goes first
+            # precisely so a full_docs failure cannot leave a status row
+            # pointing at missing content. What matters here is that the retry
+            # is not blocked by a missing-anchor refusal.
+            assert second.status == "not_found", f"{second.message}"
+        else:
+            assert second.status == "success", f"{injection_point}: {second.message}"
+            assert await rag.full_docs.get_by_id(doc_id) is None
+        assert await rag.doc_status.get_by_id(doc_id) is None
+
+        # Converged clean: no orphaned contributions, no dangling anchors.
+        report = await audit_kg_integrity(rag)
+        assert report["orphan_entities"] == []
+        assert report["orphan_relations"] == []
+        assert report["missing_entity_anchors"] == {}
+        assert report["missing_relation_anchors"] == {}
+        assert await rag.full_entities.get_by_id(doc_id) is None
+        assert await rag.full_relations.get_by_id(doc_id) is None
+    finally:
+        await rag.finalize_storages()
 
 
 @pytest.mark.asyncio
@@ -291,7 +400,12 @@ async def test_custom_chunk_failure_then_restart_rollback_converges(
     rag2 = await _build_rag(tmp_path, workspace)
     try:
         result = await rag2.arollback_failed_custom_chunk_patches()
-        assert result == {"rolled_back": ["doc-1"], "failed": []}
+        assert result == {
+            "rolled_back_count": 1,
+            "failed_count": 0,
+            "rolled_back_sample": ["doc-1"],
+            "failed_sample": [],
+        }
 
         row = await rag2.doc_status.get_by_id("doc-1")
         assert _status_text(row) == DocStatus.PROCESSED.value
@@ -328,5 +442,156 @@ async def test_audit_tool_detects_and_repairs_missing_anchor(tmp_path):
 
         report = await audit_kg_integrity(rag)
         assert report["missing_entity_anchors"] == {}
+    finally:
+        await rag.finalize_storages()
+
+
+def _wire_fake_extraction_with_relation(rag: LightRAG) -> None:
+    """Test-local extraction override: ALICE, BOB, and an edge between them
+    per chunk.
+
+    Overrides ``rag._process_extract_entities`` AFTER ``_build_rag`` has
+    already wired the shared ``_wire_fake_extraction`` (single-entity, no
+    relations) default. This function is applied only by the test below and
+    never mutates ``_wire_fake_extraction`` itself, so every sibling test in
+    this file that calls ``_build_rag`` keeps its original one-entity,
+    zero-relation wiring and is unaffected.
+    """
+
+    async def fake_extract(chunks, *args, **kwargs):
+        results = []
+        for chunk_id in chunks:
+            nodes = {
+                "ALICE": [
+                    {
+                        "entity_name": "ALICE",
+                        "entity_type": "person",
+                        "description": "ALICE description",
+                        "source_id": chunk_id,
+                        "file_path": "d.txt",
+                        "timestamp": 1,
+                    }
+                ],
+                "BOB": [
+                    {
+                        "entity_name": "BOB",
+                        "entity_type": "person",
+                        "description": "BOB description",
+                        "source_id": chunk_id,
+                        "file_path": "d.txt",
+                        "timestamp": 1,
+                    }
+                ],
+            }
+            edges = {
+                ("ALICE", "BOB"): [
+                    {
+                        "src_id": "ALICE",
+                        "tgt_id": "BOB",
+                        "description": "ALICE knows BOB",
+                        "keywords": "acquaintance",
+                        "source_id": chunk_id,
+                        "file_path": "d.txt",
+                        "weight": 1.0,
+                        "timestamp": 1,
+                    }
+                ]
+            }
+            results.append((nodes, edges))
+        return results
+
+    rag._process_extract_entities = fake_extract
+
+
+@pytest.mark.asyncio
+async def test_audit_tool_detects_true_orphan_after_anchor_loss_and_purge(tmp_path):
+    """Coverage for ``audit_kg_integrity``'s orphan-*detection* path itself,
+    for BOTH the entity and relation classification branches.
+
+    This is NOT a regression test for the test above
+    (``test_audit_tool_detects_and_repairs_missing_anchor``): that test's
+    entity is *unanchored* but still resolvable — its source chunk survives,
+    so the audit tool reports it under ``missing_entity_anchors`` and repairs
+    it. A "true" orphan (``report["orphan_entities"]`` /
+    ``report["orphan_relations"]``) is stronger: a node or edge whose
+    ``source_id`` points ONLY at chunks that no longer exist anywhere, so no
+    document can be determined at all. Every orphan assertion elsewhere in
+    this suite and in ``test_purge_primitive.py`` is ``== []`` — none of them
+    ever puts a real orphan in front of the tool. If ``audit_kg_integrity``'s
+    orphan-detection logic silently broke for either branch (e.g. stopped
+    flagging nodes/edges with an unresolvable ``source_id``, or either the
+    ``orphan_entities.append(...)`` or the ``orphan_relations.append(...)``
+    call in ``kg_integrity_repair.py`` were deleted), no test would fail.
+    This test exists solely to guard both paths at once.
+
+    Construction (matches the tool's own module docstring: "installations
+    that ingested documents BEFORE the write-ahead recovery anchors landed
+    may hold graph data that full_entities / full_relations do not
+    reference"): this test wires a test-local extraction override
+    (``_wire_fake_extraction_with_relation``) that produces ALICE, BOB, and
+    an edge between them per chunk — unlike the shared
+    ``_wire_fake_extraction`` default (ALICE only, no relations) every other
+    test in this file uses. After an ordinary ingest, BOTH anchor rows AND
+    the source chunks are removed directly, leaving ALICE, BOB, and the edge
+    between them all pointing at a chunk id that no longer resolves to any
+    document — which is what makes them orphans rather than merely unanchored.
+
+    NOTE: this construction deliberately does NOT go through purge. It used
+    to: with both anchors gone, candidate discovery resolved to an empty set
+    on both sides, so purge skipped the graph while deleting the chunks
+    anyway, and that was the cheapest way to manufacture real orphans. That
+    was the documented gap this test's previous docstring flagged as an
+    intentional signal — "if a future change closes the gap ... these
+    assertions would need to be deliberately updated". The gap is now closed:
+    purge fails closed with ``RecoveryAnchorMissingError`` instead of
+    silently skipping (see ``test_purge_fail_closed`` /
+    ``test_delete_fail_closed``), so the orphan state has to be constructed
+    by hand. Both detection branches are still exercised exactly as before.
+    """
+    workspace = f"fim-true-orphan-{uuid4().hex[:8]}"
+    doc_id = compute_mdhash_id("orphan.txt", prefix="doc-")
+
+    rag = await _build_rag(tmp_path, workspace)
+    _wire_fake_extraction_with_relation(rag)
+    try:
+        await rag.apipeline_enqueue_documents(
+            input="orphan doc", file_paths="orphan.txt"
+        )
+        await rag.apipeline_process_enqueue_documents()
+
+        row = await rag.doc_status.get_by_id(doc_id)
+        chunk_ids = list(
+            dict.fromkeys(
+                c for c in (row.get("chunks_list") or []) if isinstance(c, str) and c
+            )
+        )
+        assert chunk_ids, "fixture must produce at least one chunk to purge"
+
+        # Simulate a pre-#3400 installation: BOTH recovery anchors were
+        # never written for this document.
+        await rag.full_entities.delete([doc_id])
+        await rag.full_relations.delete([doc_id])
+
+        # And remove the source chunks, which is what turns the surviving
+        # graph objects from "unanchored but repairable" into true orphans:
+        # their source_id now resolves to nothing, so no owning document can
+        # be determined at all.
+        await rag.text_chunks.delete(chunk_ids)
+        await rag.chunks_vdb.delete(chunk_ids)
+        await rag.text_chunks.index_done_callback()
+        await rag.chunks_vdb.index_done_callback()
+
+        # Both nodes and the edge survive, now pointing at a chunk id that no
+        # longer resolves to any document.
+        assert await rag.chunk_entity_relation_graph.get_node("ALICE") is not None
+        assert await rag.chunk_entity_relation_graph.get_node("BOB") is not None
+        assert (
+            await rag.chunk_entity_relation_graph.get_edge("ALICE", "BOB") is not None
+        )
+        assert await rag.text_chunks.get_by_id(chunk_ids[0]) is None
+
+        report = await audit_kg_integrity(rag)
+        assert report["orphan_entities"] == ["ALICE", "BOB"]
+        assert report["orphan_relations"] == [["ALICE", "BOB"]]
     finally:
         await rag.finalize_storages()

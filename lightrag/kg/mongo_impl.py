@@ -2,30 +2,54 @@ import os
 import re
 import json
 import time
+import hashlib
 from dataclasses import dataclass, field
 import numpy as np
 import configparser
 import asyncio
 
-from typing import Any, Union, final
+from typing import Any, ClassVar, Sequence, Union, final
 
 from ..base import (
+    CURSOR_END,
+    CURSOR_START,
     BaseGraphStorage,
     BaseKVStorage,
     BaseVectorStorage,
+    CursorAfter,
+    CursorPosition,
     DocProcessingStatus,
+    DocSchedulingRecord,
     DocStatus,
+    DocStatusPage,
     DocStatusStorage,
+    SourceAbsent,
+    SourceConflict,
+    SourceConflictPage,
+    SourceConflictRepairResult,
+    SourceConflictSummary,
+    SourceResolution,
+    SourceUnique,
 )
 from ..utils import (
     logger,
     compute_mdhash_id,
     _cooperative_yield,
     merge_source_ids,
+    validate_interpreted_attribute_names,
     validate_workspace,
 )
 from ..types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
-from ..constants import GRAPH_FIELD_SEP, DEFAULT_QUERY_PRIORITY
+from ..constants import (
+    CUSTOM_CHUNK_PATCH_METADATA_KEY,
+    GRAPH_FIELD_SEP,
+    DEFAULT_QUERY_PRIORITY,
+)
+from ..exceptions import (
+    SourceConflictRepairCASError,
+    StorageControlPlaneError,
+    StorageRecordNotFoundError,
+)
 from .._version import __version__
 from ..kg.shared_storage import get_data_init_lock, get_namespace_lock
 
@@ -73,6 +97,16 @@ _DUPLICATE_KEY_CODE = 11000
 # watching a large migration see liveness (mirrors the OpenSearch canonical-id
 # migration's progress cadence).
 _EDGE_MIGRATION_PROGRESS_INTERVAL = 50_000
+
+# Ceiling on how many same-depth candidates get a degree lookup before the
+# max_nodes cap in the bidirectional BFS. node_degrees_batch binds the whole
+# list into two `$in` arrays, and one hub can put 100k neighbours in a single
+# level -- an array that size inflates the command document and forces the
+# planner through a huge index-bounds list for a ranking that only decides the
+# order of candidates max_nodes will mostly discard anyway. (Deliberately not
+# shared with the OpenSearch constant of the same value: that one is derived
+# from index.max_terms_count / search.max_buckets, this one from $in size.)
+_GRAPH_DEGREE_RANK_MAX_CANDIDATES = 8192
 
 
 def _canonical_edge_endpoints(
@@ -327,6 +361,8 @@ class MongoKVStorage(BaseKVStorage):
     db: AsyncDatabase = field(default=None)
     _data: AsyncCollection = field(default=None)
 
+    supports_strict_point_reads: ClassVar[bool] = True
+
     def __init__(self, namespace, global_config, embedding_func, workspace=None):
         super().__init__(
             namespace=namespace,
@@ -401,6 +437,15 @@ class MongoKVStorage(BaseKVStorage):
             doc.setdefault("create_time", 0)
             doc.setdefault("update_time", 0)
         return doc
+
+    async def get_by_id_strict(self, id: str) -> dict[str, Any] | None:
+        """Strict point read: complete-or-raise (base contract).
+
+        ``find_one`` either answers definitively or raises a ``PyMongoError``
+        — nothing is swallowed on this path, so a ``None`` IS a confirmed
+        absence (the FAILED-stub deletion path may act on it).
+        """
+        return await self.get_by_id(id)
 
     async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
         cursor = self._data.find({"_id": {"$in": ids}})
@@ -552,6 +597,12 @@ class MongoDocStatusStorage(DocStatusStorage):
     db: AsyncDatabase = field(default=None)
     _data: AsyncCollection = field(default=None)
 
+    supports_strict_point_reads: ClassVar[bool] = True
+
+    # Bounded upper limit on the sample of conflicting doc IDs surfaced by the
+    # source-conflict listing/repair APIs — never materialize the whole set.
+    _CONFLICT_SAMPLE_CAP: ClassVar[int] = 32
+
     def _prepare_doc_status_data(self, doc: dict[str, Any]) -> dict[str, Any]:
         """Normalize and migrate a raw Mongo document to DocProcessingStatus-compatible dict."""
         # Make a copy of the data to avoid modifying the original
@@ -575,6 +626,22 @@ class MongoDocStatusStorage(DocStatusStorage):
             else:
                 data.pop("error", None)
         return data
+
+    def _mongo_doc_processing_status_from_doc(
+        self, doc: dict[str, Any]
+    ) -> DocProcessingStatus:
+        """Normalise a raw Mongo document into a FULL DocProcessingStatus.
+
+        Single source of the raw -> status construction shared by
+        ``get_docs_by_statuses`` and the ``get_full_docs_by_ids`` hydration
+        path. Raises ``KeyError``/``TypeError`` on a malformed document
+        (``TypeError`` is what construction raises on missing required
+        fields); the caller decides strict (raise) vs relaxed (skip).
+        Fields the dataclass does not declare are tolerated — see
+        ``DocProcessingStatus.from_stored``.
+        """
+        data = self._prepare_doc_status_data(doc)
+        return DocProcessingStatus.from_stored(data)
 
     def __init__(self, namespace, global_config, embedding_func, workspace=None):
         super().__init__(
@@ -643,6 +710,15 @@ class MongoDocStatusStorage(DocStatusStorage):
     async def get_by_id(self, id: str) -> Union[dict[str, Any], None]:
         return await self._data.find_one({"_id": id})
 
+    async def get_by_id_strict(self, id: str) -> Union[dict[str, Any], None]:
+        """Strict point read: complete-or-raise (base contract).
+
+        ``find_one`` either answers definitively or raises a ``PyMongoError``
+        — nothing is swallowed on this path, so a ``None`` IS a confirmed
+        absence.
+        """
+        return await self._data.find_one({"_id": id})
+
     async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
         cursor = self._data.find({"_id": {"$in": ids}})
         docs = await cursor.to_list(length=None)
@@ -696,12 +772,15 @@ class MongoDocStatusStorage(DocStatusStorage):
         return await self.get_docs_by_statuses([status])
 
     async def get_docs_by_statuses(
-        self, statuses: list[DocStatus]
+        self, statuses: list[DocStatus], strict: bool = False
     ) -> dict[str, DocProcessingStatus]:
         """Get all documents matching any of the given statuses in a single query.
 
         Uses MongoDB's $in operator to fetch all matching statuses in one
-        round-trip instead of one find() call per status.
+        round-trip instead of one find() call per status.  Transport errors
+        always propagate; ``strict=True`` additionally raises on any record
+        that cannot be converted (complete-or-raise scheduling contract, see
+        base class).
         """
         if not statuses:
             return {}
@@ -711,12 +790,16 @@ class MongoDocStatusStorage(DocStatusStorage):
         result = {}
         for doc in docs:
             try:
-                data = self._prepare_doc_status_data(doc)
-                result[doc["_id"]] = DocProcessingStatus(**data)
-            except KeyError as e:
+                result[doc["_id"]] = self._mongo_doc_processing_status_from_doc(doc)
+            except (KeyError, TypeError) as e:
+                # TypeError is what DocProcessingStatus(**data) actually raises
+                # on missing required fields — without it here, the relaxed
+                # skip-and-log contract silently becomes crash-the-whole-call.
                 logger.error(
                     f"[{self.workspace}] Missing required field for document {doc['_id']}: {e}"
                 )
+                if strict:
+                    raise
                 continue
         return result
 
@@ -728,12 +811,19 @@ class MongoDocStatusStorage(DocStatusStorage):
         result = await cursor.to_list()
         processed_result = {}
         for doc in result:
+            doc_id_hint = doc.get("_id", "<unknown>") if doc else "<unknown>"
             try:
-                data = self._prepare_doc_status_data(doc)
-                processed_result[doc["_id"]] = DocProcessingStatus(**data)
-            except KeyError as e:
+                processed_result[doc["_id"]] = (
+                    self._mongo_doc_processing_status_from_doc(doc)
+                )
+            except (KeyError, TypeError) as e:
+                # TypeError, not just KeyError: DocProcessingStatus is a
+                # dataclass, so a row missing a required field (or carrying an
+                # unknown one) raises TypeError. Catching KeyError alone left
+                # the real failure uncaught and crashed the whole listing.
                 logger.error(
-                    f"[{self.workspace}] Missing required field for document {doc['_id']}: {e}"
+                    f"[{self.workspace}] Missing required field for document "
+                    f"{doc_id_hint}: {e}"
                 )
                 continue
         return processed_result
@@ -834,6 +924,14 @@ class MongoDocStatusStorage(DocStatusStorage):
                     "partialFilterExpression": {
                         "content_hash": {"$exists": True, "$type": "string", "$gt": ""}
                     },
+                },
+                # Keyset sweep index for the bounded scheduling page API:
+                # matches the MUST sort of get_docs_by_statuses_page
+                # ((created_at ASC, _id ASC) within each status branch of a
+                # status $in — the server merges the per-status keysets).
+                {
+                    "name": f"{workspace_prefix}status_created_at_id_asc",
+                    "keys": [("status", 1), ("created_at", 1), ("_id", 1)],
                 },
             ]
 
@@ -984,7 +1082,7 @@ class MongoDocStatusStorage(DocStatusStorage):
 
                 data = self._prepare_doc_status_data(doc)
 
-                doc_status = DocProcessingStatus(**data)
+                doc_status = DocProcessingStatus.from_stored(data)
                 documents.append((doc_id, doc_status))
             except KeyError as e:
                 logger.error(
@@ -1030,20 +1128,26 @@ class MongoDocStatusStorage(DocStatusStorage):
     async def get_doc_by_file_basename(
         self, basename: str
     ) -> Union[tuple[str, dict[str, Any]], None]:
-        """Mongo-native override of basename-based document lookup.
+        """Mongo-native override of basename-based document lookup (legacy).
 
         The caller is responsible for passing an already-canonical basename;
         stored ``file_path`` values are canonicalized by the business layer, so
         this lookup performs an exact match only and relies on the file_path
         index created by ``create_and_migrate_indexes_if_not_exists``.
-        """
-        if not basename:
-            return None
-        if basename == "unknown_source":
-            return None
 
+        Returns the PRIMARY (``metadata.is_duplicate != true``) row only —
+        duplicate-attempt ``dup-*`` markers keep the same canonical basename
+        and must never satisfy an identity lookup. Legacy error semantics:
+        query failures are logged and read as a best-effort miss (``None``);
+        callers that need "None == confirmed absent" or conflict detection must
+        use :meth:`resolve_doc_source_strict`.
+        """
+        if not basename or basename == "unknown_source":
+            return None
         try:
-            doc = await self._data.find_one({"file_path": basename})
+            doc = await self._data.find_one(
+                {"file_path": basename, "metadata.is_duplicate": {"$ne": True}}
+            )
         except PyMongoError as e:
             logger.error(f"[{self.workspace}] Error in get_doc_by_file_basename: {e}")
             return None
@@ -1054,30 +1158,563 @@ class MongoDocStatusStorage(DocStatusStorage):
             return None
         return str(doc_id), doc
 
+    async def resolve_doc_source_strict(
+        self, canonical_source_key: str
+    ) -> SourceResolution:
+        """Typed, conflict-aware source resolution (see base contract).
+
+        Locates up to two PRIMARY (``metadata.is_duplicate != true``) rows via
+        an indexed ``find(...).limit(2)`` and maps 0/1/≥2 →
+        Absent/Unique/Conflict. Transport/query errors PROPAGATE (a swallowed
+        failure would read as :class:`SourceAbsent`, and scan/enqueue treat
+        Absent as "confirmed new", minting duplicate primaries). The ≥2 branch
+        runs one cheap indexed ``count_documents`` for the exact candidate
+        count surfaced in the conflict.
+        """
+        if not canonical_source_key or canonical_source_key == "unknown_source":
+            return SourceAbsent()
+
+        query = {
+            "file_path": canonical_source_key,
+            "metadata.is_duplicate": {"$ne": True},
+        }
+        cursor = self._data.find(query).limit(2)
+        rows = await cursor.to_list(length=2)
+        if not rows:
+            return SourceAbsent()
+        if len(rows) == 1:
+            doc = rows[0]
+            return SourceUnique(
+                doc_id=str(doc.get("_id")),
+                doc=self._scheduling_record_from_doc(doc, strict=True),
+            )
+        candidate_count = await self._data.count_documents(query)
+        return SourceConflict(
+            candidate_count=candidate_count,
+            sample_doc_ids=tuple(sorted(str(d.get("_id")) for d in rows)),
+        )
+
     async def get_doc_by_content_hash(
-        self, content_hash: str
+        self, content_hash: str, *, exclude_doc_id: str | None = None
     ) -> Union[tuple[str, dict[str, Any]], None]:
         """Mongo-native override of content-hash document lookup.
 
         Uses the partial ``content_hash`` index. Empty strings are treated as a
         miss to align with the partial-index predicate; legacy rows missing the
-        field cannot match a non-empty query because ``find_one`` requires an
-        exact value.
+        field cannot match a non-empty query because the query requires an
+        exact value. ``exclude_doc_id`` adds ``_id: {$ne: ...}`` plus a ``$nor``
+        clause dropping any row that merely POINTS at that id (``is_duplicate``
+        naming it as ``original_doc_id``), so the duplicate check excludes both
+        the doc being processed and a record of it in-query (see base contract),
+        still served by the content_hash index. Both are query predicates, so
+        skipping a pointer row cannot truncate the search — the sort + ``limit``
+        still yield the earliest row that survives them.
+
+        Fail-closed: a query error PROPAGATES. ``None`` means "confirmed no
+        other holder", which the dedup callers act on destructively — they
+        enqueue the document and ingest its content — so reporting a transport
+        failure as "no duplicate" would mint duplicate rows and duplicate
+        graph contributions.
+
+        ``sort`` makes the "earliest other holder" of the base contract real:
+        ``find_one`` alone returns whatever the index/natural order yields, so
+        the ``original_doc_id`` written into a duplicate's row would vary
+        between runs over the same data.
         """
         if not content_hash:
             return None
 
-        try:
-            doc = await self._data.find_one({"content_hash": content_hash})
-        except PyMongoError as e:
-            logger.error(f"[{self.workspace}] Error in get_doc_by_content_hash: {e}")
+        query: dict[str, Any] = {"content_hash": content_hash}
+        if exclude_doc_id is not None:
+            query["_id"] = {"$ne": exclude_doc_id}
+            query["$nor"] = [
+                {
+                    "metadata.is_duplicate": True,
+                    "metadata.original_doc_id": exclude_doc_id,
+                }
+            ]
+        cursor = self._data.find(query).sort([("created_at", 1), ("_id", 1)]).limit(1)
+        rows = await cursor.to_list(length=1)
+        if not rows:
             return None
-        if not doc:
-            return None
+        doc = rows[0]
         doc_id = doc.get("_id")
         if doc_id is None:
             return None
         return str(doc_id), doc
+
+    # ------------------------------------------------------------------
+    # Memory-bounding scheduling API (Phase 1)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _encode_cursor(created_at: str | None, doc_id: str) -> str:
+        return json.dumps([created_at, doc_id], ensure_ascii=False)
+
+    @staticmethod
+    def _decode_cursor(opaque: str) -> tuple[str | None, str]:
+        try:
+            decoded = json.loads(opaque)
+            created, doc_id = decoded
+            if not isinstance(doc_id, str):
+                raise ValueError("cursor id must be a string")
+            if created is not None and not isinstance(created, str):
+                raise ValueError("cursor created_at must be a string or null")
+        except (ValueError, TypeError) as e:
+            raise StorageControlPlaneError(
+                f"Malformed scheduling cursor for MongoDocStatusStorage: {e}"
+            ) from e
+        return created, doc_id
+
+    @staticmethod
+    def _doc_cursor_key(doc: dict[str, Any]) -> tuple[str | None, str]:
+        """(created_at, _id) keyset key of a RAW query-returned doc.
+
+        A missing/null/non-string created_at encodes as ``None`` — the
+        missing/null bucket, which BSON sorts BEFORE every string. Encoding
+        it as ``""`` would break the resume filter: ``{"created_at": ""}``
+        matches neither a missing field nor a null value, so a second corrupt
+        row past the page boundary would silently fall out of the sweep. The
+        ``None`` marker resumes with the ``{"created_at": None}`` predicate,
+        which Mongo defines to match BOTH missing and null."""
+        created = doc.get("created_at")
+        return (created if isinstance(created, str) else None, str(doc.get("_id")))
+
+    def _scheduling_record_from_doc(
+        self, doc: dict[str, Any], *, strict: bool
+    ) -> DocSchedulingRecord | None:
+        """Project one raw Mongo doc; strict raises on unusable docs, relaxed
+        returns None (the caller still counts the doc as consumed)."""
+        doc_id = str(doc.get("_id"))
+        try:
+            status = DocStatus(str(doc["status"]))
+            created_at = doc["created_at"]
+            updated_at = doc.get("updated_at", created_at)
+            if not isinstance(created_at, str) or not isinstance(updated_at, str):
+                raise TypeError("created_at/updated_at must be strings")
+            metadata = doc.get("metadata")
+            return DocSchedulingRecord(
+                id=doc_id,
+                status=status,
+                created_at=created_at,
+                updated_at=updated_at,
+                file_path=doc.get("file_path") or "no-file-path",
+                track_id=doc.get("track_id"),
+                has_custom_chunk_journal=isinstance(metadata, dict)
+                and isinstance(metadata.get(CUSTOM_CHUNK_PATCH_METADATA_KEY), dict),
+            )
+        except (KeyError, TypeError, ValueError) as e:
+            logger.error(f"[{self.workspace}] Unusable scheduling row {doc_id}: {e}")
+            if strict:
+                raise
+            return None
+
+    async def get_docs_by_statuses_page(
+        self,
+        statuses: list[DocStatus],
+        *,
+        limit: int,
+        position: CursorPosition = CURSOR_START,
+        strict: bool = False,
+    ) -> DocStatusPage:
+        """Bounded keyset page: one indexed ``find`` with ``sort`` + ``limit``.
+
+        ``created_at`` is stored as an ISO-8601 string, so the keyset
+        comparison stays string-typed end to end (cursor ↔ query ↔ sort).
+
+        Consumed-position contract: every predicate (status, keyset resume) is
+        evaluated SERVER-side, so the
+        set of query-returned docs IS the set of consumed records — the
+        frontier is the last RETURNED doc's ``(created_at, _id)`` key, and
+        fewer returned docs than ``limit`` proves the sweep is exhausted
+        (CURSOR_END). A relaxed-mode conversion skip drops the doc from the
+        page but the doc was still returned by the query, hence consumed:
+        the cursor advances past it (never re-read, never terminal-by-skip).
+
+        Transport/query errors always propagate (never swallowed into a
+        partial page); ``strict=True`` additionally raises on any returned
+        doc that cannot be projected to :class:`DocSchedulingRecord`.
+        """
+        if limit <= 0:
+            raise ValueError(f"page limit must be positive, got {limit}")
+        if not statuses or position is CURSOR_END:
+            return DocStatusPage(docs={}, next_position=CURSOR_END)
+
+        query: dict[str, Any] = {"status": {"$in": sorted({s.value for s in statuses})}}
+        and_clauses: list[dict[str, Any]] = []
+        if isinstance(position, CursorAfter):
+            created, doc_id = self._decode_cursor(position.opaque)
+            if created is None:
+                # Cursor inside the missing/null bucket (sorted first by
+                # BSON): continue through its remaining docs by _id —
+                # {"created_at": None} matches BOTH missing and null — then
+                # every doc with a real (non-null, existing) value.
+                and_clauses.append(
+                    {
+                        "$or": [
+                            {"created_at": None, "_id": {"$gt": doc_id}},
+                            {"created_at": {"$ne": None}},
+                        ]
+                    }
+                )
+            else:
+                # Past the missing/null bucket: string-typed $gt/$eq never
+                # match missing or null fields, which is correct — that
+                # bucket was already consumed before this cursor.
+                and_clauses.append(
+                    {
+                        "$or": [
+                            {"created_at": {"$gt": created}},
+                            {"created_at": created, "_id": {"$gt": doc_id}},
+                        ]
+                    }
+                )
+        if and_clauses:
+            query["$and"] = and_clauses
+
+        cursor = (
+            self._data.find(query).sort([("created_at", 1), ("_id", 1)]).limit(limit)
+        )
+        raw_docs = await cursor.to_list(length=limit)
+
+        docs: dict[str, DocSchedulingRecord] = {}
+        for doc in raw_docs:
+            record = self._scheduling_record_from_doc(doc, strict=strict)
+            if record is None:
+                continue  # relaxed skip: query-returned, hence still consumed
+            docs[record.id] = record
+
+        if len(raw_docs) < limit:
+            return DocStatusPage(docs=docs, next_position=CURSOR_END)
+        last_created, last_id = self._doc_cursor_key(raw_docs[-1])
+        return DocStatusPage(
+            docs=docs,
+            next_position=CursorAfter(self._encode_cursor(last_created, last_id)),
+        )
+
+    async def count_docs_by_statuses(
+        self, statuses: list[DocStatus], *, strict: bool = True
+    ) -> int:
+        """Fail-closed status count: accurate ``count_documents`` or raise
+        (errors propagate — admission control treats an error as "refuse")."""
+        if not statuses:
+            return 0
+        return await self._data.count_documents(
+            {"status": {"$in": sorted({s.value for s in statuses})}}
+        )
+
+    async def update_doc_status_fields(
+        self,
+        doc_id: str,
+        fields: dict[str, Any],
+        *,
+        missing_ok: bool = False,
+    ) -> None:
+        """Targeted ``$set`` of the given fields only (no read-modify-write,
+        so a huge ``chunks_list`` never travels through memory)."""
+        if "created_at" in fields:
+            raise ValueError(
+                "created_at is an immutable scheduling sort key and cannot "
+                "be changed via update_doc_status_fields"
+            )
+        if not fields:
+            # Mongo rejects an empty $set document; still honour the
+            # existence contract for a no-op update.
+            if missing_ok:
+                return
+            if await self._data.find_one({"_id": doc_id}, {"_id": 1}) is None:
+                raise StorageRecordNotFoundError(doc_id)
+            return
+        result = await self._data.update_one({"_id": doc_id}, {"$set": fields})
+        if result.matched_count == 0:
+            if missing_ok:
+                return
+            raise StorageRecordNotFoundError(doc_id)
+
+    # ------------------------------------------------------------------
+    # Strict batch read
+    # ------------------------------------------------------------------
+
+    async def get_docs_by_ids(
+        self,
+        doc_ids: Sequence[str],
+        *,
+        strict: bool = False,
+    ) -> dict[str, DocSchedulingRecord]:
+        """Batch strict read (see base contract).
+
+        One indexed ``find({"_id": {"$in": ids}})`` — the server answers
+        definitively or raises, so any id absent from the result set is a
+        CONFIRMED absence (never a swallowed failure). ``strict=True`` raises
+        on any returned doc that cannot be projected to
+        :class:`DocSchedulingRecord`, failing the WHOLE call rather than
+        returning a partial mapping.
+        """
+        ids = list(doc_ids)
+        if not ids:
+            return {}
+        cursor = self._data.find({"_id": {"$in": ids}})
+        raw_docs = await cursor.to_list(length=None)
+        result: dict[str, DocSchedulingRecord] = {}
+        for doc in raw_docs:
+            record = self._scheduling_record_from_doc(doc, strict=strict)
+            if record is None:
+                continue
+            result[record.id] = record
+        return result
+
+    async def get_full_docs_by_ids(
+        self,
+        doc_ids: Sequence[str],
+        *,
+        strict: bool = False,
+    ) -> dict[str, DocProcessingStatus]:
+        """Batch hydration to full DocProcessingStatus (see base contract).
+
+        One indexed ``find({"_id": {"$in": ids}})`` — the server answers
+        definitively or raises, so any id absent from the result set is a
+        CONFIRMED absence and is omitted. Reuses the SAME raw ->
+        DocProcessingStatus normalisation as ``get_docs_by_statuses``.
+        ``strict=True`` raises on any returned document that cannot be
+        converted, failing the WHOLE call rather than returning a partial
+        mapping.
+        """
+        ids = list(doc_ids)
+        if not ids:
+            return {}
+        cursor = self._data.find({"_id": {"$in": ids}})
+        raw_docs = await cursor.to_list(length=None)
+        result: dict[str, DocProcessingStatus] = {}
+        for doc in raw_docs:
+            try:
+                result[doc["_id"]] = self._mongo_doc_processing_status_from_doc(doc)
+            except (KeyError, TypeError) as e:
+                logger.error(
+                    f"[{self.workspace}] Unusable doc_status document hydrating "
+                    f"{doc.get('_id')}: {e}"
+                )
+                if strict:
+                    raise
+                continue
+        return result
+
+    # ------------------------------------------------------------------
+    # Source-conflict listing and explicit CAS repair
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _conflict_fingerprint(sorted_doc_ids: list[str]) -> str:
+        """Deterministic digest over candidate doc IDs in stable sort order."""
+        digest = hashlib.sha256()
+        for doc_id in sorted_doc_ids:
+            digest.update(doc_id.encode("utf-8"))
+            digest.update(b"\x00")
+        return digest.hexdigest()
+
+    @staticmethod
+    def _decode_conflict_cursor(opaque: str) -> str:
+        try:
+            key = json.loads(opaque)
+            if not isinstance(key, str):
+                raise ValueError("conflict cursor must be a string")
+        except (ValueError, TypeError) as e:
+            raise StorageControlPlaneError(
+                f"Malformed source-conflict cursor for MongoDocStatusStorage: {e}"
+            ) from e
+        return key
+
+    async def _primary_candidates(
+        self, canonical_source_key: str, *, session: Any = None
+    ) -> list[str]:
+        """Sorted primary (``metadata.is_duplicate != true``) doc IDs for a
+        canonical key, projecting only ``_id`` (optionally in a session)."""
+        cursor = self._data.find(
+            {"file_path": canonical_source_key, "metadata.is_duplicate": {"$ne": True}},
+            {"_id": 1},
+            session=session,
+        )
+        rows = await cursor.to_list(length=None)
+        return sorted(str(r.get("_id")) for r in rows)
+
+    async def _primary_candidate_sample(
+        self, canonical_source_key: str
+    ) -> tuple[str, ...]:
+        """The lexicographically first ``_CONFLICT_SAMPLE_CAP`` primary ids.
+
+        Server-side bounded: ``sort(_id) + limit(cap)`` projecting only ``_id``,
+        so a key with a pathological number of primaries still ships a fixed
+        sample (unlike an aggregation ``$push`` of every id).
+        """
+        cursor = (
+            self._data.find(
+                {
+                    "file_path": canonical_source_key,
+                    "metadata.is_duplicate": {"$ne": True},
+                },
+                {"_id": 1},
+            )
+            .sort([("_id", 1)])
+            .limit(self._CONFLICT_SAMPLE_CAP)
+        )
+        rows = await cursor.to_list(length=self._CONFLICT_SAMPLE_CAP)
+        return tuple(str(r.get("_id")) for r in rows)
+
+    async def list_source_conflicts_page(
+        self,
+        *,
+        limit: int,
+        position: CursorPosition = CURSOR_START,
+    ) -> SourceConflictPage:
+        """Page canonical source keys with >1 primary candidate (see base).
+
+        A server-side aggregation groups PRIMARY (``metadata.is_duplicate !=
+        true``) rows by ``file_path``, keeps groups with candidate count ≥ 2,
+        resumes strictly after the cursor's canonical key (``$gt``) and sorts
+        by canonical key so the keyset is stable.
+
+        The accumulator is COUNT-ONLY: ``$push``-ing the ids would build one
+        array per distinct ``file_path`` in the workspace — every group, not
+        just the conflicting ones, since ``candidate_count >= 2`` can only be
+        applied AFTER ``$group`` — so peak aggregation memory would scale with
+        the document count instead of the number of source keys. Samples are
+        instead fetched per SURFACED key (at most ``limit`` bounded queries),
+        so nothing unbounded crosses the wire either. Detecting "keys with more
+        than one primary" inherently groups the whole collection, so the group
+        set itself still scales with the number of distinct source keys (as it
+        does on PostgreSQL) — ``allowDiskUse`` covers that.
+        """
+        if limit <= 0:
+            raise ValueError(f"page limit must be positive, got {limit}")
+        if position is CURSOR_END:
+            return SourceConflictPage(conflicts=(), next_position=CURSOR_END)
+
+        match: dict[str, Any] = {
+            "file_path": {
+                "$type": "string",
+                "$nin": ["", "unknown_source", "no-file-path"],
+            },
+            "metadata.is_duplicate": {"$ne": True},
+        }
+        if isinstance(position, CursorAfter):
+            match["file_path"]["$gt"] = self._decode_conflict_cursor(position.opaque)
+
+        pipeline = [
+            {"$match": match},
+            {"$group": {"_id": "$file_path", "candidate_count": {"$sum": 1}}},
+            {"$match": {"candidate_count": {"$gte": 2}}},
+            {"$sort": {"_id": 1}},
+            {"$limit": limit},
+        ]
+        cursor = await self._data.aggregate(pipeline, allowDiskUse=True)
+        groups = await cursor.to_list(length=limit)
+
+        summaries: list[SourceConflictSummary] = []
+        for group in groups:
+            canonical = str(group["_id"])
+            summaries.append(
+                SourceConflictSummary(
+                    canonical_source_key=canonical,
+                    candidate_count=int(group["candidate_count"]),
+                    sample_doc_ids=await self._primary_candidate_sample(canonical),
+                )
+            )
+        conflicts = tuple(summaries)
+        if len(groups) < limit:
+            next_position: CursorPosition = CURSOR_END
+        else:
+            next_position = CursorAfter(
+                json.dumps(str(groups[-1]["_id"]), ensure_ascii=False)
+            )
+        return SourceConflictPage(conflicts=conflicts, next_position=next_position)
+
+    async def repair_source_conflict(
+        self,
+        canonical_source_key: str,
+        *,
+        primary_doc_id: str,
+        expected_candidate_count: int,
+        expected_candidate_fingerprint: str,
+        dry_run: bool = True,
+    ) -> SourceConflictRepairResult:
+        """Demote all-but-one primary to duplicate, CAS-guarded (see base).
+
+        A dry run reads the current candidate set and returns the
+        count/fingerprint the operator must echo back. A commit re-reads the
+        candidates INSIDE a Mongo transaction; if the count/fingerprint no
+        longer match the echoed expectation it raises
+        ``SourceConflictRepairCASError`` (CAS — never overwrites a concurrent
+        change) and the transaction aborts. Otherwise every losing candidate
+        is marked ``metadata.is_duplicate=true`` +
+        ``original_doc_id=primary_doc_id`` in the same transaction (content is
+        never deleted). ``primary_doc_id`` absent from the current candidate
+        set raises ``ValueError``.
+
+        The transaction gives snapshot isolation, not predicate locking: a new
+        primary INSERTed for the same canonical key mid-repair is a phantom the
+        snapshot never sees and no write conflict reports. See the base contract
+        for what ``committed`` does and does not claim, and for the caller-side
+        keyed lock that serializes repair against enqueue.
+        """
+        if dry_run:
+            candidates = await self._primary_candidates(canonical_source_key)
+            count = len(candidates)
+            fingerprint = self._conflict_fingerprint(candidates)
+            if primary_doc_id not in candidates:
+                raise ValueError(
+                    f"primary_doc_id {primary_doc_id!r} is not a current primary "
+                    f"candidate for {canonical_source_key!r}"
+                )
+            demoted = [d for d in candidates if d != primary_doc_id]
+            return SourceConflictRepairResult(
+                canonical_source_key=canonical_source_key,
+                primary_doc_id=primary_doc_id,
+                candidate_count=count,
+                fingerprint=fingerprint,
+                demoted_sample_doc_ids=tuple(demoted[: self._CONFLICT_SAMPLE_CAP]),
+                committed=False,
+            )
+
+        async with self.db.client.start_session() as session:
+            async with await session.start_transaction():
+                candidates = await self._primary_candidates(
+                    canonical_source_key, session=session
+                )
+                count = len(candidates)
+                fingerprint = self._conflict_fingerprint(candidates)
+                if primary_doc_id not in candidates:
+                    raise ValueError(
+                        f"primary_doc_id {primary_doc_id!r} is not a current "
+                        f"primary candidate for {canonical_source_key!r}"
+                    )
+                if (
+                    count != expected_candidate_count
+                    or fingerprint != expected_candidate_fingerprint
+                ):
+                    raise SourceConflictRepairCASError(
+                        f"[{self.workspace}] source-conflict repair CAS failed for "
+                        f"{canonical_source_key!r}: candidate set changed "
+                        f"(count {count} vs {expected_candidate_count})"
+                    )
+                demoted = [d for d in candidates if d != primary_doc_id]
+                if demoted:
+                    await self._data.update_many(
+                        {"_id": {"$in": demoted}},
+                        {
+                            "$set": {
+                                "metadata.is_duplicate": True,
+                                "metadata.original_doc_id": primary_doc_id,
+                            }
+                        },
+                        session=session,
+                    )
+        return SourceConflictRepairResult(
+            canonical_source_key=canonical_source_key,
+            primary_doc_id=primary_doc_id,
+            candidate_count=count,
+            fingerprint=fingerprint,
+            demoted_sample_doc_ids=tuple(demoted[: self._CONFLICT_SAMPLE_CAP]),
+            committed=True,
+        )
 
 
 @final
@@ -1571,8 +2208,27 @@ class MongoGraphStorage(BaseGraphStorage):
 
         Returns:
             list[tuple[str, str]]: List of (source_label, target_label) tuples representing edges
-            None: If no edges found
+            None: If the node does not exist
+
+        An existing node with no relations returns ``[]``, NOT ``None`` — the
+        BaseGraphStorage contract, as implemented by NetworkXStorage. No in-tree
+        caller reads the distinction today (they all guard with ``if edges:``),
+        so this restores the declared contract rather than fixing a live caller;
+        collapsing the two here is what makes the information unrecoverable for
+        a caller that needs it. A backend error is neither value: it propagates.
         """
+        # Existence is decided by the node collection, before the edge scan —
+        # never inferred from the edges. upsert_edge / upsert_edges_batch now
+        # materialize both endpoints, so a dangling target should not arise from
+        # new writes, but rows written before that change still can carry one,
+        # and a read contract must not rest on a write-path invariant anyway.
+        # Inferring existence from the edge scan would make this method
+        # contradict has_node() on the same id, and delete_entity 404s on
+        # has_node(). Checking first also means an absent node costs one indexed
+        # point lookup instead of a full edge scan.
+        if not await self.has_node(source_node_id):
+            return None
+
         cursor = self.edge_collection.find(
             {
                 "$or": [
@@ -1722,10 +2378,62 @@ class MongoGraphStorage(BaseGraphStorage):
     # -------------------------------------------------------------------------
     #
 
+    # MongoDB owns ``_id``: it is the node/edge document key and this class uses
+    # it as the update *filter*, so a caller-supplied ``_id`` in the attribute
+    # mapping is never an attribute -- it is an attempt to move the document.
+    # No legacy exposure: ``get_node`` / ``get_edge`` already strip ``_id`` for
+    # exactly this reason, so a rewrite never carries it back in.
+    # (``source_node_id`` / ``target_node_id`` / ``edge_lo`` / ``edge_hi`` need no
+    # entry here: ``upsert_edge`` assigns them *after* spreading the caller's
+    # mapping, so a supplied value is discarded by construction.)
+    _RESERVED_ATTRIBUTE_NAMES = frozenset({"_id"})
+
+    def _validate_attribute_names(self, attributes: dict, *, context: str) -> None:
+        """Reject attribute names MongoDB would interpret rather than store.
+
+        Attribute names reach the server inside a ``$set`` document, where they
+        are *field paths*: a dot addresses a subfield, so ``{"source_ids.0": x}``
+        rewrites the first element of the chunk-attribution array instead of
+        creating a field called ``source_ids.0``, and a leading ``$`` is read as
+        an update operator. Unlike the value rules, this hazard is specific to
+        this backend -- see ``validate_interpreted_attribute_names``.
+
+        Characters are deliberately not checked: MongoDB stores a name holding a
+        control character just fine, so rejecting one here would be a rule wider
+        than this backend's hazard. That character rule belongs to the
+        GraphML-backed store, which genuinely cannot serialize such a name.
+
+        Safe against pre-existing data despite rewrite paths spreading stored
+        attributes back into the payload: the two refused shapes cannot come
+        *out* of this collection. A legacy ``{"a.b": v}`` was interpreted as a
+        path when it was written, so the document holds ``{"a": {"b": v}}`` and
+        ``get_node`` returns the key ``a``; a ``$``-prefixed name was refused by
+        the server outright. That is also why the rule stops at the
+        interpretation hazard -- a merely unusual name such as ``display-name``
+        *is* stored flat and does round-trip, so rejecting it would strand the
+        entity.
+        """
+        validate_interpreted_attribute_names(attributes, context=context)
+        reserved = sorted(self._RESERVED_ATTRIBUTE_NAMES.intersection(attributes))
+        if reserved:
+            raise ValueError(
+                f"{context}: attribute name(s) {', '.join(reserved)} are reserved "
+                "by MongoDB and cannot be set as graph attributes"
+            )
+
+    def _node_context(self, node_id: str) -> str:
+        """Error-message prefix identifying a node write."""
+        return f"[{self.workspace}] node `{node_id}`"
+
+    def _edge_context(self, source_node_id: str, target_node_id: str) -> str:
+        """Error-message prefix identifying an edge write."""
+        return f"[{self.workspace}] edge `{source_node_id}`~`{target_node_id}`"
+
     async def upsert_node(self, node_id: str, node_data: dict[str, str]) -> None:
         """
         Insert or update a node document.
         """
+        self._validate_attribute_names(node_data, context=self._node_context(node_id))
         update_doc = {"$set": {**node_data}}
         if node_data.get("source_id", ""):
             update_doc["$set"]["source_ids"] = node_data["source_id"].split(
@@ -1745,15 +2453,40 @@ class MongoGraphStorage(BaseGraphStorage):
         writers race the first insert, the loser hits a ``DuplicateKeyError``; we
         retry once, which now matches the just-inserted doc and updates it.
         """
-        # Ensure source node exists
-        await self.upsert_node(source_node_id, {})
+        # Materialize BOTH endpoints, not just the source. A target-only
+        # endpoint would otherwise carry edges with no node document, and that
+        # dangling state is externally visible: has_node() says absent while the
+        # edge scan says connected, get_popular_labels ranks an id get_node
+        # returns nothing for, and delete_entity 404s on an entity whose edges
+        # are right there. NetworkXStorage.add_edge and PGOpsGraphStorage both
+        # create both ends; this makes the document backends agree.
+        #
+        # One bulk_write instead of two round trips, and $setOnInsert (the form
+        # upsert_edges_batch already uses) so an endpoint that already carries
+        # real properties is never touched. dict.fromkeys collapses a self-loop.
+        # Snapshot before validating, and build the update from the snapshot
+        # below. The endpoint bulk_write awaits between the check and the use, so
+        # validating the caller's own mapping would leave a window in which a
+        # caller that retains it could add a field path such as ``source_ids.0``
+        # after the check. (This also subsumes the "copy so we never mutate the
+        # caller's dict" reason the copy below already existed for.)
+        edge_attributes = dict(edge_data)
+        self._validate_attribute_names(
+            edge_attributes, context=self._edge_context(source_node_id, target_node_id)
+        )
+        await self.collection.bulk_write(
+            [
+                UpdateOne({"_id": nid}, {"$setOnInsert": {"_id": nid}}, upsert=True)
+                for nid in dict.fromkeys((source_node_id, target_node_id))
+            ],
+            ordered=False,
+        )
 
         edge_lo, edge_hi = _canonical_edge_endpoints(source_node_id, target_node_id)
 
-        # Copy so we never mutate the caller's edge_data dict.
-        set_doc: dict = {**edge_data}
-        if edge_data.get("source_id", ""):
-            set_doc["source_ids"] = edge_data["source_id"].split(GRAPH_FIELD_SEP)
+        set_doc: dict = dict(edge_attributes)
+        if edge_attributes.get("source_id", ""):
+            set_doc["source_ids"] = edge_attributes["source_id"].split(GRAPH_FIELD_SEP)
         set_doc["source_node_id"] = source_node_id
         set_doc["target_node_id"] = target_node_id
         set_doc["edge_lo"] = edge_lo
@@ -1783,6 +2516,9 @@ class MongoGraphStorage(BaseGraphStorage):
             return
         ops: list[tuple[Any, int, str]] = []
         for node_id, node_data in nodes:
+            self._validate_attribute_names(
+                node_data, context=self._node_context(node_id)
+            )
             update_doc: dict = {"$set": {**node_data}}
             if node_data.get("source_id", ""):
                 update_doc["$set"]["source_ids"] = node_data["source_id"].split(
@@ -1824,9 +2560,9 @@ class MongoGraphStorage(BaseGraphStorage):
     ) -> None:
         """Batch insert/update multiple edges using a single bulk_write() call.
 
-        Also ensures source nodes exist (matching upsert_edge() behaviour) via a
-        separate bulk_write on the node collection for any source nodes that need
-        to be created as empty placeholders.
+        Also ensures BOTH endpoints of every edge exist (matching upsert_edge()
+        behaviour) via a separate bulk_write on the node collection for any
+        endpoint that needs to be created as an empty placeholder.
 
         Args:
             edges: List of (source_node_id, target_node_id, edge_data) tuples.
@@ -1834,15 +2570,35 @@ class MongoGraphStorage(BaseGraphStorage):
         if not edges:
             return
 
-        # Ensure all source nodes exist (mirrors upsert_edge's upsert_node call)
-        source_node_ids = list(dict.fromkeys(src for src, _tgt, _data in edges))
+        # Whole batch first: the endpoint-placeholder bulk_write below happens
+        # before any edge document is written, so rejecting mid-loop would leave
+        # placeholder nodes behind for edges that were never created.
+        #
+        # Snapshot each mapping as it is validated and use the snapshots for the
+        # documents built after the placeholder await -- see upsert_edge for the
+        # window that closes.
+        validated_edges: list[tuple[str, str, dict]] = []
+        for src, tgt, edge_data in edges:
+            edge_attributes = dict(edge_data)
+            self._validate_attribute_names(
+                edge_attributes, context=self._edge_context(src, tgt)
+            )
+            validated_edges.append((src, tgt, edge_attributes))
+
+        # Both endpoints, not just the source — see upsert_edge for why a
+        # target-only endpoint is externally visible as an inconsistency.
+        endpoint_ids = list(
+            dict.fromkeys(
+                node_id for src, tgt, _data in edges for node_id in (src, tgt)
+            )
+        )
         node_ops: list[tuple[Any, int, str]] = [
             (
-                UpdateOne({"_id": src}, {"$setOnInsert": {"_id": src}}, upsert=True),
-                _estimate_doc_bytes({"_id": src}),
-                src,
+                UpdateOne({"_id": nid}, {"$setOnInsert": {"_id": nid}}, upsert=True),
+                _estimate_doc_bytes({"_id": nid}),
+                nid,
             )
-            for src in source_node_ids
+            for nid in endpoint_ids
         ]
         await _run_batched_bulk_write(
             self.collection,
@@ -1851,7 +2607,7 @@ class MongoGraphStorage(BaseGraphStorage):
             max_records_per_batch=self._max_upsert_records_per_batch,
             ordered=False,
             log_prefix=f"[{self.workspace}] {self.namespace} edges:",
-            what="source-node placeholder upsert",
+            what="edge endpoint placeholder upsert",
         )
 
         # Key every edge by its canonical (edge_lo, edge_hi) pair and dedupe
@@ -1860,10 +2616,10 @@ class MongoGraphStorage(BaseGraphStorage):
         # and avoids an intra-batch duplicate-key error from two ops inserting
         # the same endpoint pair.
         deduped_ops: dict[tuple[str, str], tuple[Any, int, str]] = {}
-        for source_node_id, target_node_id, edge_data in edges:
-            update_doc: dict = {"$set": {**edge_data}}
-            if edge_data.get("source_id", ""):
-                update_doc["$set"]["source_ids"] = edge_data["source_id"].split(
+        for source_node_id, target_node_id, edge_attributes in validated_edges:
+            update_doc: dict = {"$set": dict(edge_attributes)}
+            if edge_attributes.get("source_id", ""):
+                update_doc["$set"]["source_ids"] = edge_attributes["source_id"].split(
                     GRAPH_FIELD_SEP
                 )
             update_doc["$set"]["source_node_id"] = source_node_id
@@ -2022,6 +2778,83 @@ class MongoGraphStorage(BaseGraphStorage):
             docs_by_id[str(doc["_id"])] = doc
         return [docs_by_id[node_id] for node_id in node_ids if node_id in docs_by_id]
 
+    async def _rank_edge_endpoints_by_degree(
+        self, limit: int, skip: int = 0
+    ) -> list[str]:
+        """Rank edge endpoints by undirected degree, ties on the label ascending.
+
+        Paged rather than fetched whole because the ``$limit`` runs server-side:
+        the caller cannot tell how many of a page really have node documents
+        until it has fetched them, so it needs a way to ask for the next ones.
+        The sort is a TOTAL order -- degree descending, then the unique ``_id``
+        -- which is what makes ``$skip`` paging over it stable across passes.
+        """
+        if limit <= 0:
+            return []
+
+        pipeline: list[dict[str, Any]] = [
+            {"$project": {"source_node_id": 1, "_id": 0}},
+            {"$group": {"_id": "$source_node_id", "degree": {"$sum": 1}}},
+            {
+                "$unionWith": {
+                    "coll": self._edge_collection_name,
+                    "pipeline": [
+                        {"$project": {"target_node_id": 1, "_id": 0}},
+                        {
+                            "$group": {
+                                "_id": "$target_node_id",
+                                "degree": {"$sum": 1},
+                            }
+                        },
+                    ],
+                }
+            },
+            {"$group": {"_id": "$_id", "degree": {"$sum": "$degree"}}},
+            # Degree descending, then label ascending. The tie-break is the
+            # BaseGraphStorage contract: $limit cuts a band of equal-degree
+            # entities, and without a second sort key which ones survive is
+            # whatever order the aggregation happens to emit.
+            {"$sort": {"degree": -1, "_id": 1}},
+        ]
+        if skip:
+            pipeline.append({"$skip": skip})
+        pipeline.append({"$limit": limit})
+
+        cursor = await self.edge_collection.aggregate(pipeline, allowDiskUse=True)
+        return [str(doc["_id"]) async for doc in cursor]
+
+    async def _accept_existing_nodes(
+        self,
+        candidate_ids: list[str],
+        limit: int,
+        result: KnowledgeGraph,
+        accepted: list[str],
+    ) -> None:
+        """Append the candidates that really have node documents, up to `limit`.
+
+        ``_fetch_nodes_by_ids`` preserves the requested order and drops ids with
+        no document, so consuming it in order preserves the ranking and never
+        lets an id that resolves to nothing occupy a slot.
+
+        Asks for the current shortfall first and for the remainder only if that
+        did not fill it, so at most two queries: the caller passes whole ranked
+        pages, and filling the handful of slots a few dangling ids vacated must
+        not pull a page of node documents to place a few nodes.
+        """
+        if not candidate_ids or len(accepted) >= limit:
+            return
+
+        head = candidate_ids[: limit - len(accepted)]
+        for chunk in (head, candidate_ids[len(head) :]):
+            if not chunk or len(accepted) >= limit:
+                break
+            docs = await self._fetch_nodes_by_ids(chunk, {"source_ids": 0})
+            for doc in docs:
+                if len(accepted) >= limit:
+                    break
+                accepted.append(str(doc["_id"]))
+                result.nodes.append(self._construct_graph_node(doc["_id"], doc))
+
     async def get_knowledge_graph_all_by_degree(
         self, max_depth: int, max_nodes: int
     ) -> KnowledgeGraph:
@@ -2036,49 +2869,65 @@ class MongoGraphStorage(BaseGraphStorage):
 
         result.is_truncated = total_node_count > max_nodes
         if result.is_truncated:
-            # Get all node_ids ranked by degree if max_nodes exceeds total node count
-            pipeline = [
-                {"$project": {"source_node_id": 1, "_id": 0}},
-                {"$group": {"_id": "$source_node_id", "degree": {"$sum": 1}}},
-                {
-                    "$unionWith": {
-                        "coll": self._edge_collection_name,
-                        "pipeline": [
-                            {"$project": {"target_node_id": 1, "_id": 0}},
-                            {
-                                "$group": {
-                                    "_id": "$target_node_id",
-                                    "degree": {"$sum": 1},
-                                }
-                            },
-                        ],
-                    }
-                },
-                {"$group": {"_id": "$_id", "degree": {"$sum": "$degree"}}},
-                {"$sort": {"degree": -1}},
-                {"$limit": max_nodes},
-            ]
-            cursor = await self.edge_collection.aggregate(pipeline, allowDiskUse=True)
-
-            node_ids = []
-            async for doc in cursor:
-                node_id = str(doc["_id"])
-                node_ids.append(node_id)
+            # The ranked ids are edge ENDPOINTS, and upsert_edge only guarantees
+            # the source node exists, so one can be a dangling id with no node
+            # document -- a legacy state this backend deliberately tolerates
+            # (see the traversal, which counts only documents it actually read).
+            # Taking the $limit as final let such an id consume a slot and the
+            # answer came back short, reachable as soon as ties break on the
+            # label because a dangling label sorts like any other.
+            # Page the band until the cap fills or the band runs out, so a
+            # vacated slot always goes to the next-ranked entry. The loop is
+            # what keeps the top-up below meaning what it says: it is reachable
+            # only once every edge-backed entity has been offered a slot, so
+            # everything it can still pick really is degree-0. Stopping earlier
+            # would let an isolate outrank an entity further down the band --
+            # only ONE dangling id in this page plus one in the next is enough
+            # to reach that, so it is not a corner.
+            #
+            # Whole pages, not shortfall-sized ones: a page is {_id, degree}
+            # rows, cheap next to the aggregation that produces it, so each
+            # extra pass should make as much progress as it can. The document
+            # fetch inside _accept_existing_nodes stays shortfall-sized.
+            node_ids: list[str] = []
+            skip = 0
+            while len(node_ids) < max_nodes:
+                ranked_page = await self._rank_edge_endpoints_by_degree(
+                    max_nodes, skip=skip
+                )
+                skip += len(ranked_page)
+                await self._accept_existing_nodes(
+                    ranked_page, max_nodes, result, node_ids
+                )
+                if len(ranked_page) < max_nodes:
+                    break  # short page: the band is exhausted
 
             if len(node_ids) < max_nodes:
+                # Top up from the isolated (degree-0) entities, in label order
+                # for the same reason the ranking above breaks ties on the
+                # label: an unordered `find` handed the shortfall to whichever
+                # documents the collection scan reached first. These come from
+                # the node collection, so they exist by construction and are
+                # appended directly. list(node_ids), not node_ids: the cursor is
+                # consumed while appending to the same list, and a live
+                # reference makes the $nin filter depend on when it serializes.
                 remaining = max_nodes - len(node_ids)
-                cursor = self.collection.find(
-                    {"_id": {"$nin": node_ids}},
-                    {"source_ids": 0},
-                ).limit(remaining)
+                cursor = (
+                    self.collection.find(
+                        {"_id": {"$nin": list(node_ids)}},
+                        {"source_ids": 0},
+                    )
+                    .sort("_id", 1)
+                    .limit(remaining)
+                )
                 async for doc in cursor:
                     node_ids.append(str(doc["_id"]))
+                    result.nodes.append(self._construct_graph_node(doc["_id"], doc))
 
-            docs = await self._fetch_nodes_by_ids(node_ids, {"source_ids": 0})
-            for doc in docs:
-                result.nodes.append(self._construct_graph_node(doc["_id"], doc))
-
-            # As node count reaches the limit, only need to fetch the edges that directly connect to these nodes
+            # As node count reaches the limit, only need to fetch the edges that
+            # directly connect to these nodes. Filtered on the RESOLVED ids: a
+            # dangling endpoint left in here would surface an edge pointing at a
+            # node the response does not contain.
             edge_cursor = self.edge_collection.find(
                 {
                     "$and": [
@@ -2092,7 +2941,6 @@ class MongoGraphStorage(BaseGraphStorage):
             cursor = self.collection.find({}, {"source_ids": 0})
 
             async for doc in cursor:
-                node_id = str(doc["_id"])
                 result.nodes.append(self._construct_graph_node(doc["_id"], doc))
 
             edge_cursor = self.edge_collection.find({})
@@ -2114,18 +2962,50 @@ class MongoGraphStorage(BaseGraphStorage):
         max_depth: int,
         max_nodes: int,
     ) -> KnowledgeGraph:
-        if depth > max_depth or len(result.nodes) > max_nodes:
+        if depth > max_depth:
             return result
 
-        cursor = self.collection.find({"_id": {"$in": node_labels}})
+        # Project away source_ids: ranking materialises the WHOLE level before
+        # the cap can discard any of it (the pre-ranking loop could stop at the
+        # first node past max_nodes), and source_ids is the one unbounded field
+        # on the document. The wildcard path feeds _construct_graph_node from a
+        # {"source_ids": 0} cursor already, so it is provably not needed here.
+        cursor = self.collection.find({"_id": {"$in": node_labels}}, {"source_ids": 0})
 
+        # node_labels can name the same node twice (reached by two edges of the
+        # previous level); a duplicate reaching the admission loop would spend a
+        # second slot and trip the cap on a node that is not new.
+        level_nodes = []
+        level_seen = set()
         async for node in cursor:
             node_id = node["_id"]
-            if node_id not in seen_nodes:
-                seen_nodes.add(node_id)
-                result.nodes.append(self._construct_graph_node(node_id, node))
-                if len(result.nodes) > max_nodes:
-                    return result
+            if node_id in seen_nodes or node_id in level_seen:
+                continue
+            level_seen.add(node_id)
+            level_nodes.append(node)
+
+        # find() answers in natural order, not $in order, so an overflowing
+        # level needs the contract's ranking before the cap reads it. Only an
+        # overflowing level pays: a level that fits is admitted whole, and the
+        # contract binds which nodes survive, not their order.
+        if len(level_nodes) > 1 and len(result.nodes) + len(level_nodes) > max_nodes:
+            level_degrees = await self.node_degrees_batch(
+                [
+                    node["_id"]
+                    for node in level_nodes[:_GRAPH_DEGREE_RANK_MAX_CANDIDATES]
+                ]
+            )
+            level_nodes.sort(
+                key=lambda node: (-level_degrees.get(node["_id"], 0), node["_id"])
+            )
+
+        for node in level_nodes:
+            node_id = node["_id"]
+            if len(result.nodes) >= max_nodes:
+                result.is_truncated = True
+                return result
+            seen_nodes.add(node_id)
+            result.nodes.append(self._construct_graph_node(node_id, node))
 
         # Collect neighbors
         # Get both inbound and outbound one hop nodes
@@ -2267,19 +3147,42 @@ class MongoGraphStorage(BaseGraphStorage):
             key=lambda x: (x["depth"], -x["weight"]),
         )
 
-        # As order matters, we need to use another list to store the node_id
-        # And only take the first max_nodes ones
-        node_ids = []
+        # Dedupe edge endpoints (excluding the start node) preserving the
+        # existing depth/weight priority order.
+        ordered_candidates = []
+        seen_candidates = set()
         for edge in node_edges:
-            if len(node_ids) < max_nodes and edge["source_node_id"] not in seen_nodes:
-                node_ids.append(edge["source_node_id"])
-                seen_nodes.add(edge["source_node_id"])
+            for candidate in (edge["source_node_id"], edge["target_node_id"]):
+                if candidate != node_label and candidate not in seen_candidates:
+                    seen_candidates.add(candidate)
+                    ordered_candidates.append(candidate)
 
-            if len(node_ids) < max_nodes and edge["target_node_id"] not in seen_nodes:
-                node_ids.append(edge["target_node_id"])
-                seen_nodes.add(edge["target_node_id"])
+        # Candidates are raw edge endpoints: upsert_edge only guarantees the
+        # source node exists, not the target, so some candidates may be
+        # dangling (no node document). Resolve real existence in priority
+        # order, in bounded batches, stopping once max_nodes real candidates
+        # are confirmed -- the start node already occupies one of the
+        # max_nodes slots, so only the first max_nodes - 1 real ids end up in
+        # the result, and finding a max_nodes-th real candidate proves
+        # truncation without having to probe the entire reachable set.
+        real_ids = []
+        batch_size = max(max_nodes, 1)
+        for i in range(0, len(ordered_candidates), batch_size):
+            if len(real_ids) >= max_nodes:
+                break
+            batch = ordered_candidates[i : i + batch_size]
+            found_cursor = self.collection.find({"_id": {"$in": batch}}, {"_id": 1})
+            found_ids = {doc["_id"] async for doc in found_cursor}
+            for candidate in batch:
+                if candidate in found_ids:
+                    real_ids.append(candidate)
+                    if len(real_ids) >= max_nodes:
+                        break
 
-        # Filter out all the node whose id is same as node_label so that we do not check existence next step
+        result.is_truncated = len(real_ids) >= max_nodes
+        node_ids = real_ids[: max_nodes - 1]
+        seen_nodes.update(node_ids)
+
         cursor = self.collection.find({"_id": {"$in": node_ids}})
 
         async for doc in cursor:
@@ -2497,9 +3400,22 @@ class MongoGraphStorage(BaseGraphStorage):
 
         Returns:
             List of labels(entity names) sorted by degree (highest first)
+
+        Two phases, and the second one usually does not run. Phase 1 ranks the
+        entities that HAVE edges, straight off the edge collection — the cheap
+        aggregation, and on any graph with more than ``limit`` connected
+        entities it fills every slot on its own. Only when it comes up short
+        does phase 2 top the result up from the isolated (degree-0) entities,
+        which is exactly the case the edge-only ranking got wrong by returning
+        nothing at all for a graph whose entities carry no relations.
+
+        Giving every node a degree-0 baseline row inside the aggregation instead
+        would be simpler, but it forces a full pass over the node collection on
+        every call — on a large graph, to produce a result phase 1 already had.
         """
         try:
-            # Use aggregation pipeline to count edges per node and sort by degree
+            # Self-loops count twice (the source and target groups each see the
+            # document), matching the other backends.
             pipeline = [
                 # Count outbound edges
                 {"$group": {"_id": "$source_node_id", "out_degree": {"$sum": 1}}},
@@ -2545,13 +3461,35 @@ class MongoGraphStorage(BaseGraphStorage):
                 if doc.get("_id"):
                     labels.append(doc["_id"])
 
+            if len(labels) < limit:
+                # Phase 1 returned fewer than `limit`, and its aggregation is
+                # exact, so the connected set is now known in full: every node
+                # outside it has no edge at all. Top up in label order, bounded
+                # by the shortfall — the sort rides the _id index, so this stops
+                # as soon as it has enough rather than scanning the collection.
+                # list(labels), not labels: the cursor is consumed below while
+                # appending to the same list, and handing the driver a live
+                # reference makes the filter depend on when it serializes.
+                isolated_cursor = (
+                    self.collection.find({"_id": {"$nin": list(labels)}}, {"_id": 1})
+                    .sort("_id", 1)
+                    .limit(limit - len(labels))
+                )
+                async for doc in isolated_cursor:
+                    if doc.get("_id"):
+                        labels.append(doc["_id"])
+
             logger.debug(
                 f"[{self.workspace}] Retrieved {len(labels)} popular labels (limit: {limit})"
             )
             return labels
         except Exception as e:
+            # Raise, never return []: an empty list here is indistinguishable
+            # from "the graph has no entities". /graph/label/popular already
+            # turns an exception into a 500, so swallowing it handed the WebUI a
+            # 200 with an empty entity picker while the database was down.
             logger.error(f"[{self.workspace}] Error getting popular labels: {str(e)}")
-            return []
+            raise
 
     async def _try_atlas_text_search(self, query_strip: str, limit: int) -> list[str]:
         """Try Atlas Search using simple text search."""
@@ -2703,11 +3641,15 @@ class MongoGraphStorage(BaseGraphStorage):
             return labels
 
         except Exception as e:
+            # Last resort in the progressive chain: the Atlas methods are allowed
+            # to fail (they may simply be unavailable) and fall through to here,
+            # but if the regex scan itself fails the search produced no answer at
+            # all. Returning [] would report that as "nothing matched".
             logger.error(f"[{self.workspace}] Regex fallback search failed: {e}")
             import traceback
 
             logger.error(f"[{self.workspace}] Traceback: {traceback.format_exc()}")
-            return []
+            raise
 
     async def search_labels(self, query: str, limit: int = 50) -> list[str]:
         """
@@ -2730,8 +3672,10 @@ class MongoGraphStorage(BaseGraphStorage):
                 )
                 return []
         except PyMongoError as e:
+            # A failed count is not "the graph is empty" — that shortcut would
+            # report a transport blip as "no labels match".
             logger.error(f"[{self.workspace}] Error counting nodes: {e}")
-            return []
+            raise
 
         # Progressive search strategy
         search_methods = [

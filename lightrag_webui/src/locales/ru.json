@@ -10,8 +10,9 @@
     "documents": "Документы",
     "knowledgeGraph": "Граф знаний",
     "retrieval": "Поиск",
-    "api": "API",
+    "apiDocs": "Документация API",
     "projectRepository": "Репозиторий проекта",
+    "appSettings": "Настройки",
     "logout": "Выйти",
     "frontendNeedsRebuild": "Требуется пересборка фронтенда",
     "themeToggle": {
@@ -37,7 +38,10 @@
     "cancel": "Отмена",
     "save": "Сохранить",
     "saving": "Сохранение...",
-    "saveFailed": "Ошибка сохранения"
+    "saveFailed": "Ошибка сохранения",
+    "errorBoundaryTitle": "Что-то пошло не так",
+    "errorBoundaryDescription": "Не удалось отобразить эту панель. Повторите попытку или перейдите на другую вкладку.",
+    "errorBoundaryRetry": "Повторить"
   },
   "documentPanel": {
     "clearDocuments": {
@@ -99,7 +103,7 @@
         "error": "Некоторые файлы не удалось загрузить"
       },
       "generalError": "Ошибка загрузки\n{{error}}",
-      "fileTypes": "Поддерживаемые типы: TXT, MD, TEXTPACK, MDX, DOCX, PDF, PPTX, XLSX, RTF, ODT, EPUB, HTML, HTM, TEX, JSON, XML, YAML, YML, CSV, LOG, CONF, INI, PROPERTIES, SQL, BAT, SH, C, CPP, H, HPP, PY, JAVA, JS, TS, SWIFT, GO, RB, PHP, CSS, SCSS, LESS",
+      "fileTypes": "Поддерживаемые типы: {{types}}",
       "fileUploader": {
         "singleFileLimit": "Нельзя загрузить более 1 файла за раз",
         "maxFilesLimit": "Нельзя загрузить более {{count}} файлов",
@@ -139,7 +143,7 @@
       "filters": {
         "all": "Все",
         "completed": "Завершено",
-        "parse": "Извлечение",
+        "parse": "Разбор",
         "analyze": "Анализ",
         "process": "Обработка",
         "failed": "Ошибка"
@@ -177,7 +181,6 @@
     "pipelineStatus": {
       "title": "Статус конвейера",
       "busy": "Конвейер занят",
-      "requestPending": "Запрос ожидает",
       "cancellationRequested": "Запрошена отмена",
       "jobName": "Название задачи",
       "startTime": "Время начала",
@@ -330,6 +333,7 @@
       "editPropertyDescription": "Отредактируйте значение свойства в текстовой области ниже.",
       "errors": {
         "duplicateName": "Имя узла уже существует",
+        "invalidEntityName": "Введите допустимое имя узла",
         "updateFailed": "Не удалось обновить узел",
         "tryAgainLater": "Пожалуйста, попробуйте позже",
         "updateSuccessButMergeFailed": "Свойства обновлены, но слияние не удалось: {{error}}",
@@ -424,6 +428,7 @@
     },
     "retrieval": {
       "startPrompt": "Начните поиск, введя ваш запрос ниже",
+      "scrollToBottom": "К последнему сообщению",
       "clear": "Очистить",
       "send": "Отправить",
       "stop": "Остановить",
@@ -481,9 +486,6 @@
       "enableRerank": "Включить ранжирование",
       "enableRerankTooltip": "Включить ранжирование для извлечённых текстовых фрагментов. Если True, но модель ранжирования не настроена, будет выдано предупреждение. По умолчанию True."
     }
-  },
-  "apiSite": {
-    "loading": "Загрузка документации API..."
   },
   "apiKeyAlert": {
     "title": "Требуется API ключ",

@@ -39,6 +39,7 @@ from lightrag.constants import (
     PARSER_ENGINE_DOCLING,
     PARSER_ENGINE_MINERU,
     PARSER_ENGINE_NATIVE,
+    PROCESS_OPTION_CHUNK_CUSTOM,
     PROCESS_OPTION_CHUNK_FIXED,
     PROCESS_OPTION_CHUNK_PARAGRAH,
     PROCESS_OPTION_CHUNK_RECURSIVE,
@@ -134,6 +135,7 @@ _ALL_CHUNK_SELECTORS = frozenset(
         PROCESS_OPTION_CHUNK_RECURSIVE,
         PROCESS_OPTION_CHUNK_VECTOR,
         PROCESS_OPTION_CHUNK_PARAGRAH,
+        PROCESS_OPTION_CHUNK_CUSTOM,
     }
 )
 
@@ -157,11 +159,12 @@ _CHUNK_PARAM_SPECS: tuple[ParamSpec, ...] = (
                 PROCESS_OPTION_CHUNK_FIXED,
                 PROCESS_OPTION_CHUNK_RECURSIVE,
                 PROCESS_OPTION_CHUNK_PARAGRAH,
+                PROCESS_OPTION_CHUNK_CUSTOM,
             }
         ),
         min_value=0,
     ),
-    # Paragraph-semantic only: drop the trailing reference section before
+    # Paragraph-semantic only: drop matching reference blocks before
     # chunking.  Detection-tuning knobs (tail window / heading prefixes) are
     # env-only and read live by the chunker, so only the switch is a hint param.
     ParamSpec(
@@ -197,7 +200,7 @@ def parse_chunk_params(
 
     ``text`` is the raw text inside ``(...)`` (parameter separators only —
     no surrounding parens).  ``selector`` is the chunk char the block is
-    attached to (``F``/``R``/``V``/``P``).  Returns ``(canonical_dict,
+    attached to (``F``/``R``/``V``/``P``/``C``).  Returns ``(canonical_dict,
     errors)``; ``errors`` is empty iff the block is fully valid.  Aliases are
     normalised to their canonical name in the returned dict.
 
@@ -320,7 +323,7 @@ def chunk_param_overlap_error(params: Mapping[str, Any]) -> str | None:
 # ---------------------------------------------------------------------------
 # Engine parameters (Phase 2) — per-file params attached to the engine token,
 # e.g. ``mineru(page_range=1-3,language=en)`` / ``docling(force_ocr=true)``.
-# Keyed by engine name (unlike chunk params, which are keyed by F/R/V/P).
+# Keyed by engine name (unlike chunk params, which are keyed by F/R/V/P/C).
 # ---------------------------------------------------------------------------
 
 _BOOL_TRUE = frozenset({"1", "true", "yes", "on", "t", "y"})
@@ -335,7 +338,7 @@ class EngineParamSpec:
     """Declares one tunable engine parameter (Phase 2).
 
     Separate from the chunk :class:`ParamSpec` (which requires a ``targets``
-    set of F/R/V/P selectors that is meaningless for engines).  ``kind`` is one
+    set of F/R/V/P/C selectors that is meaningless for engines).  ``kind`` is one
     of ``"str"`` / ``"enum"`` / ``"bool"``.  ``is_list`` marks a repeated-key
     parameter (``page_range``) whose canonical value is a comma-joined string.
     ``enum_values`` constrains an ``"enum"`` parameter.
@@ -504,6 +507,13 @@ def parse_engine_params(
     errors)``; aliases are normalised to canonical and values are coerced to
     their declared type (so ``force_ocr`` is a real ``bool``).  A list-type
     ``page_range`` collects repeated keys and joins them with ``,``.
+
+    A boolean parameter may be written bare as a flag — ``native(smart_heading)``
+    is shorthand for ``native(smart_heading=true)`` (same rule as the chunk
+    params in :func:`parse_chunk_params`).  Non-boolean parameters still require
+    the explicit ``key=value`` form.  The stored ``parse_engine`` field is always
+    re-encoded canonically (``smart_heading=true``), so the shorthand is an input
+    convenience only and never changes a cache signature.
     """
     by_name = _ENGINE_PARAM_BY_NAME.get(engine)
     if by_name is None:
@@ -521,9 +531,24 @@ def parse_engine_params(
         if not segment:
             errors.append(f"{label}: empty parameter")
             continue
-        if "=" not in segment:
-            if _PAGE_SEGMENT_RE.match(segment) and (
-                "page_range" in by_name or "pr" in by_name
+        if "=" in segment:
+            key, _, value = segment.partition("=")
+            key = key.strip()
+            value = value.strip()
+            flag_form = False
+        else:
+            # Bare flag form, e.g. ``smart_heading``.  Only valid for boolean
+            # parameters, where it is shorthand for ``smart_heading=true``.
+            key = segment
+            value = ""
+            flag_form = True
+
+        spec = by_name.get(key)
+        if spec is None:
+            if (
+                flag_form
+                and _PAGE_SEGMENT_RE.match(segment)
+                and ("page_range" in by_name or "pr" in by_name)
             ):
                 errors.append(
                     f"{label}: page lists must repeat the key, e.g. "
@@ -532,21 +557,18 @@ def parse_engine_params(
                 )
             else:
                 errors.append(
-                    f"{label}: parameter {segment!r} must be written as "
-                    "'key=value' (flag parameters are not supported yet)"
+                    f"{label}: unknown parameter {key!r} for engine {engine!r}; "
+                    f"supported parameters: {supported_engine_param_names(engine)}"
                 )
             continue
-        key, _, value = segment.partition("=")
-        key = key.strip()
-        value = value.strip()
-
-        spec = by_name.get(key)
-        if spec is None:
-            errors.append(
-                f"{label}: unknown parameter {key!r} for engine {engine!r}; "
-                f"supported parameters: {supported_engine_param_names(engine)}"
-            )
-            continue
+        if flag_form:
+            if spec.kind != "bool":
+                errors.append(
+                    f"{label}: parameter {spec.canonical!r} must be written as "
+                    "'key=value'; only boolean flags may be written bare"
+                )
+                continue
+            value = "true"  # bare boolean flag means True
         if any(ch in _VALUE_FORBIDDEN for ch in value):
             errors.append(
                 f"{label}: value for {spec.canonical!r} may not contain any of "
