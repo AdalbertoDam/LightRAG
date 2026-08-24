@@ -548,7 +548,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                         "streaming": str(param.stream),
                         "workspace": rag.workspace,
                     },
-                    input={"query": request.query, "mode": request.mode},
+                    input={"query": request.query},
                     output={k: v for k, v in result.items() if k != "llm_response"}
                 )
                 response_time = round(time.perf_counter() - start_time, 3)
@@ -911,7 +911,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             stream_mode = request.stream if request.stream is not None else True
             param = request.to_query_params(stream_mode)
 
-
+            lf_update_current_span(input={"query": request.query})
             from fastapi.responses import StreamingResponse
 
             start_time = time.perf_counter()
