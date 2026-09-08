@@ -8,16 +8,19 @@ import json
 import numpy as np
 from dataclasses import dataclass
 
+from lightrag.exceptions import CommitBookkeepingError
 from lightrag.file_atomic import atomic_write, reap_orphan_tmp_files
 from lightrag.utils import (
-    logger,
-    compute_mdhash_id,
     commit_in_storage_io,
+    compute_mdhash_id,
+    log_without_raising,
+    logger,
     validate_workspace,
 )
 from lightrag.base import BaseVectorStorage
 from lightrag.constants import DEFAULT_QUERY_PRIORITY
 
+from . import file_fingerprint
 from .shared_storage import (
     get_namespace_lock,
     get_update_flag,
@@ -114,23 +117,97 @@ class FaissVectorDBStorage(BaseVectorStorage):
            unsnapshotted dict iteration) into the pool would break the
            invariant and would require widening the lock scope instead.
 
-    Cross-process sync protocol:
-        Writer side (``index_done_callback``):
+    Cross-process sync protocol (two channels — see #3854):
+        Two independent tests decide whether this process holds a current
+        snapshot, OR-ed at the one place that asks
+        (``_reload_index_from_disk_locked``). They are not redundant — their
+        blind spots do not overlap. The mechanism lives in
+        ``lightrag.kg.file_fingerprint``; the canonical prose contract is
+        ``NetworkXStorage``'s section of the same name.
+
+        * **Authoritative channel — the file fingerprint.**
+          ``(st_mtime_ns, st_size)`` of **both** files against what this
+          process recorded when it last loaded or wrote them
+          (``_loaded_fingerprint``). State, not an event: nothing consumes
+          it and a failed notification cannot lose it. **Both files must
+          have moved** for the change to count: the publication renames them
+          one at a time, so a pair where only one moved does not describe a
+          single state, and reloading THAT is the corruption vector —
+          ``_load_faiss_index`` binds every in-range metadata row to whatever
+          vector the other file now holds. A partial change therefore reports
+          "no change" and this process keeps the older self-consistent
+          snapshot until the writer's retry completes the set (see
+          ``file_fingerprint.peer_commit_detected``). Blind spot: two
+          commits inside one filesystem timestamp tick with identical sizes.
+        * **Accelerator channel — the ``storage_updated`` flag.** Read
+          first, because a ``True`` value already answers the question.
+          ``set_all_update_flags`` publishes it with one Manager RPC per
+          process, so a partial publication leaves a peer unnotified —
+          that loss is its blind spot, and it is what the file channel
+          exists for. In exchange it covers the fingerprint's tick
+          collision, which needs a healthy, fast-committing system.
+
+        Writer side (``index_done_callback`` / ``finalize``):
             1. ``_save_faiss_index`` writes both files atomically (per
                file; cross-file atomicity is best-effort, see above).
-            2. ``set_all_update_flags`` flips every process's
-               ``storage_updated`` flag (including the writer's own).
-            3. Reset the writer's own flag to ``False`` so the next
-               ``_get_index`` does not trigger a self-reload of what we
-               just wrote.
-        Reader side (any method that goes through ``_get_index``):
-            1. Inside ``_storage_lock``, observe
-               ``storage_updated.value is True``.
-            2. **Fully reload**: re-init ``self._index`` from
+            2. Record the fingerprint of the pair just written, so this
+               process does not later read its own save as a peer's. Done
+               inside ``_save_faiss_index`` — before the caller's
+               bookkeeping, because that publishes through the manager and
+               can fail, while this is a local ``stat``.
+            3. ``set_all_update_flags`` flips every process's
+               ``storage_updated`` flag (including the writer's own), then
+               reset the writer's own flag to ``False``.
+            On a FAILED save the pair is adopted too. Step 1 is two
+            ``atomic_write`` calls, so a failure between them publishes a
+            MISMATCHED pair (a new ``.index`` beside the previous
+            ``.meta.json``) — this process's own doing, not a peer's. The
+            in-memory index plus the redo logs are the authority the retry
+            writes from; reloading the mismatched pair instead would bind one
+            row's metadata to another's vector and the replay would then
+            delete the wrong one. Opposite direction from
+            ``NetworkXStorage``, which invalidates its fingerprint after a
+            failed save *in order to* reload: it has no redo log, so its
+            in-memory graph is the untrustworthy side.
+
+            Adoption covers the failing writer only. Every OTHER process is
+            covered by the both-files-must-move rule above — they never
+            recorded this pair, so nothing local tells them the publication
+            was interrupted; only the shape of the change on disk does.
+        Reader and writer side (everything through
+        ``_reload_index_from_disk_locked``):
+            1. Inside ``_storage_lock``, test the flag; if it is ``False``,
+               test the fingerprint.
+            2. On either, **fully reload**: re-init ``self._index`` from
                ``IndexFlatIP``, clear ``self._id_to_meta``, then call
                ``_load_faiss_index`` to re-parse both files. Faiss has no
                incremental sync API.
-            3. Reset the reader's own flag.
+            3. Record the new fingerprint **and** reset the flag, whichever
+               channel fired.
+
+        **This backend does not decline a stale write, and must not.**
+        ``NetworkXStorage`` refuses to save when the file has moved past its
+        snapshot, because it has no way to keep the mutation. Here the write
+        path is *reload-then-replay*: ``index_done_callback`` reloads the
+        peer's snapshot and ``_flush_pending_locked`` replays the pending
+        buffer and the ``_unsaved_upserts`` / ``_unsaved_deletes`` redo logs
+        on top of it (issue #3688), so both sides survive and there is
+        nothing to report as a failure. Consequently the flush-failure
+        propagation NetworkX needs (a declined commit must not be
+        acknowledged as durable, see ``LightRAG._flush_storages``) has no
+        counterpart here.
+
+        Accepted residues (see *Consistency without transactions* in
+        ``AGENTS.md``):
+            * The tick collision above, **and** the notification lost for
+              this process: the peer commit is not observed. Recovery: the
+              next commit by any process flips the flag and changes the
+              fingerprint; the redo logs mean this process's own rows are
+              replayed rather than lost either way.
+            * A ``stat`` this process cannot perform on either file: the
+              file channel reports "no change" and the fence degrades to
+              the flag alone, i.e. to the behaviour that predates it. See
+              ``kg.file_fingerprint`` for why the other direction is worse.
 
     Lock scope:
         ``_storage_lock`` is a per-``(namespace, workspace)`` keyed lock
@@ -274,6 +351,15 @@ class FaissVectorDBStorage(BaseVectorStorage):
         # Keep a local store for metadata, IDs, etc.
         # Maps <int faiss_id> → metadata (including your original ID).
         self._id_to_meta = {}
+        # ``(st_mtime_ns, st_size)`` per file -- BOTH files, since either one
+        # changing means a peer wrote. The authoritative half of the
+        # cross-process fence; see *Cross-process sync protocol*. Adopted
+        # after the load below, sampled before it (``kg.file_fingerprint``).
+        self._loaded_fingerprint = None
+        # How many times the file channel caught a commit the flag channel
+        # never announced, so a deployment can tell whether the
+        # lost-notification window in #3854 actually occurs.
+        self._missed_notification_reloads = 0
 
         # Minimal pending area for deferred embedding: custom-id -> _PendingFaissDoc.
         # Holds only records not yet embedded+materialized into self._index;
@@ -321,7 +407,10 @@ class FaissVectorDBStorage(BaseVectorStorage):
             extra_patterns=(glob.escape(self._meta_file) + ".tmp",),
         )
 
+        # Sampled BEFORE the load, never after -- see ``kg.file_fingerprint``.
+        fingerprint = self._stat_fingerprint()
         self._load_faiss_index()
+        self._adopt_fingerprint(fingerprint)
 
     async def initialize(self):
         """Initialize storage data"""
@@ -334,6 +423,56 @@ class FaissVectorDBStorage(BaseVectorStorage):
             self.namespace, workspace=self.workspace
         )
 
+    def _fingerprint_paths(self) -> tuple[str, str]:
+        """Both files this storage's state spans, **in publication order**.
+
+        Index first, metadata last, matching ``_save_faiss_index``'s write
+        order. ``file_fingerprint`` treats the last path as the commit
+        marker: a complete publication leaves it no older than the files it
+        commits, so a torn pair (the index newer than the metadata that is
+        supposed to describe it) is recognisable from the files alone, by any
+        process, without having seen the previous generation.
+
+        Watching the marker ALONE would not do: a peer several generations
+        behind sees the marker changed even when a later publication has
+        already laid down a new index beside it. Reordering this pair, or
+        reordering the writes, silently breaks the test — see
+        ``file_fingerprint.publication_complete``.
+        """
+        return (self._faiss_index_file, self._meta_file)
+
+    def _stat_fingerprint(self) -> file_fingerprint.Fingerprint | object:
+        """Sample both files' identity. See ``kg.file_fingerprint``."""
+        return file_fingerprint.sample(
+            self._fingerprint_paths(), workspace=self.workspace
+        )
+
+    def _adopt_fingerprint(
+        self, fingerprint: file_fingerprint.Fingerprint | object
+    ) -> None:
+        """Record ``fingerprint`` as the file pair this process now holds."""
+        self._loaded_fingerprint = file_fingerprint.adopted(fingerprint)
+
+    def _record_fingerprint(self) -> None:
+        """Adopt the files currently on disk without reloading from them.
+
+        For the writer: after its own save the in-memory index already *is*
+        their content.
+        """
+        self._adopt_fingerprint(self._stat_fingerprint())
+
+    def _peer_commit_detected(self) -> bool:
+        """Whether the files on disk differ from the ones this process loaded.
+
+        The fence's authoritative test — the one a failed notification cannot
+        disable. See ``kg.file_fingerprint``.
+        """
+        return file_fingerprint.peer_commit_detected(
+            self._fingerprint_paths(),
+            self._loaded_fingerprint,
+            workspace=self.workspace,
+        )
+
     def _reload_index_from_disk_locked(self, *, for_write: bool = False) -> bool:
         """Reload ``self._index`` + ``self._id_to_meta`` if another process committed newer data.
 
@@ -344,22 +483,45 @@ class FaissVectorDBStorage(BaseVectorStorage):
 
         Returns True if a reload happened, False if the local snapshot was
         already current.
+
+        Two tests, per *Cross-process sync protocol*: this process's
+        ``storage_updated`` flag, read first, and the files' fingerprint
+        against what this process recorded. The second is what survives a lost
+        notification.
         """
-        if not self.storage_updated.value:
+        notified = bool(self.storage_updated.value)
+        if not notified and not self._peer_commit_detected():
             return False
 
-        log_message = (
-            f"[{self.workspace}] Process {os.getpid()} FAISS reloading {self.namespace} "
-            "due to update by another process"
-        )
-        if for_write:
-            logger.warning(log_message)
+        if notified:
+            log_message = (
+                f"[{self.workspace}] Process {os.getpid()} FAISS reloading {self.namespace} "
+                "due to update by another process"
+            )
+            if for_write:
+                logger.warning(log_message)
+            else:
+                logger.info(log_message)
         else:
-            logger.info(log_message)
+            # The lost-notification case the file channel exists for. Always a
+            # warning, on the read path too: unlike a notified reload this one
+            # says a publication failed somewhere.
+            self._missed_notification_reloads += 1
+            logger.warning(
+                f"[{self.workspace}] Process {os.getpid()} FAISS reloading "
+                f"{self.namespace}: {self._faiss_index_file} is not the file "
+                "pair this process loaded and no reload notification arrived "
+                "for it, so a notification was lost. Recovering through the "
+                f"file channel (occurrence #{self._missed_notification_reloads} "
+                "in this process)."
+            )
 
+        # Sampled BEFORE the read, never after -- see ``kg.file_fingerprint``.
+        fingerprint = self._stat_fingerprint()
         self._index = faiss.IndexFlatIP(self._dim)
         self._id_to_meta = {}
         self._load_faiss_index()
+        self._adopt_fingerprint(fingerprint)
         self.storage_updated.value = False
         return True
 
@@ -1264,7 +1426,9 @@ class FaissVectorDBStorage(BaseVectorStorage):
         call: a cancel delivered in between would leave both files published
         with the other processes never told to reload them. It runs only if the
         write succeeded — running it without a write would retire redo entries
-        for rows that were never persisted.
+        for rows that were never persisted. Its own failure is caught here as
+        ``CommitBookkeepingError`` and logged: both files are renamed into place
+        by then, so raising would tell the caller the vectors were never written.
         """
         # Save metadata dict to JSON, excluding __vector__ since vectors are
         # already stored in the Faiss index file and can be reconstructed on load.
@@ -1285,6 +1449,15 @@ class FaissVectorDBStorage(BaseVectorStorage):
         def _write_both() -> None:
             # One submission for both files: two would take two permits and
             # could interleave another namespace's commit between the halves.
+            #
+            # ORDER IS PART OF THE CONTRACT: index first, metadata LAST.
+            # The metadata rename is this storage's commit point, which is
+            # what lets ANY process recognise a complete publication from the
+            # files alone -- a complete pair has the metadata no older than
+            # the index it describes, an interrupted one leaves the index
+            # newer. See ``_fingerprint_paths`` and
+            # ``file_fingerprint.publication_complete``. Reversing this makes
+            # a torn pair indistinguishable from a committed one.
             atomic_write(
                 index_file,
                 lambda tmp: faiss.write_index(index, tmp),
@@ -1292,7 +1465,77 @@ class FaissVectorDBStorage(BaseVectorStorage):
             )
             atomic_write(meta_file, _write_meta, workspace)
 
-        await commit_in_storage_io(_write_both, on_committed)
+        try:
+
+            async def _committed() -> None:
+                # Adopt the pair this process just wrote BEFORE the caller's
+                # bookkeeping, which publishes through the manager and can
+                # fail. A local stat, so it cannot fail with it -- and doing it
+                # first means a failed publication does not additionally leave
+                # this process treating its own save as a peer's, which would
+                # cost a full reload of both files on the next call for
+                # nothing.
+                #
+                # Here rather than in each caller's hook so no save path can
+                # forget it: ``finalize`` reuses this same method.
+                self._record_fingerprint()
+                await on_committed()
+
+            try:
+                await commit_in_storage_io(_write_both, _committed)
+            except CommitBookkeepingError:
+                raise
+            except BaseException:
+                # A FAILED save still leaves the files on disk as THIS
+                # process's doing, so adopt them: the fingerprint fence must
+                # not read this process's own half-finished write as a peer
+                # commit.
+                #
+                # Unlike the single-file backends, ``_write_both`` is two
+                # ``atomic_write`` calls, so a failure between them publishes a
+                # MISMATCHED pair (a new ``.index`` beside the previous
+                # ``.meta.json``). ``self._index`` / ``self._id_to_meta`` still
+                # hold the complete post-flush snapshot, and the retry's job is
+                # to write both files from it. Reloading instead would replace
+                # that snapshot with the mismatched pair -- binding one row's
+                # metadata to another's vector (``_load_faiss_index`` keeps
+                # every metadata row whose fid is inside the shorter index and
+                # reconstructs its vector from there) -- and the redo replay
+                # would then delete the wrong vector and the next save would
+                # make that permanent, losing rows the operation never touched.
+                #
+                # Adopting hides nothing: a genuine peer commit after this
+                # moves the pair again, away from what was adopted here. The
+                # mismatched pair on disk is a pre-existing residue of the
+                # best-effort cross-file write (see the class docstring's
+                # storage model and ``_load_faiss_index``'s skew detection),
+                # not something this fence can repair.
+                self._record_fingerprint()
+                raise
+        except CommitBookkeepingError as e:
+            # Both files are already renamed into place, so the rows ARE durable
+            # and the caller must not hear otherwise: `index_done_callback`'s
+            # contract is that a raise means the vectors were not written, which
+            # aborts the document batch in `_insert_done`.
+            #
+            # What did not complete is the publication — flagging the other
+            # processes and clearing this writer's dirty bit. The residue is a
+            # visibility lag that heals: `_index_dirty` stays True, so the next
+            # commit rewrites this snapshot and notifies again; an unreset
+            # `storage_updated` only makes this process reload the files it just
+            # wrote. The hook also keeps its redo logs when it fails here, so if
+            # an unnotified peer saves its older snapshot over these rows first,
+            # the next flush replays them back rather than losing them (#3854 is
+            # the fence gap itself; this only makes it recoverable).
+            log_without_raising(
+                logger.error,
+                f"[{self.workspace}] FAISS index {self.namespace} was saved to "
+                f"{self._faiss_index_file}, but publishing that write failed: "
+                f"{e.__cause__}. An unknown remainder of the other processes "
+                "keeps reading the previous snapshot until the next commit "
+                "notifies them; this process may also reload the files it just "
+                "wrote.",
+            )
 
     def _load_faiss_index(self):
         """
@@ -1429,7 +1672,12 @@ class FaissVectorDBStorage(BaseVectorStorage):
             4. ``set_all_update_flags`` flips every registered process's
                ``storage_updated`` flag, then we immediately reset our own
                flag to ``False`` so the writer does not self-reload on the
-               next call to ``_get_index``.
+               next call to ``_get_index``. A failure here does **not**
+               raise: step 3 already made the rows durable, so this is a
+               visibility lag, logged and healed by the next commit —
+               ``_save_faiss_index`` catches it. The redo logs are retired only
+               past this step, so rows an unnotified peer overwrites are
+               replayed back by the next flush.
 
         Either failure surfaces loudly through ``_insert_done`` so the
         caller can abort the document batch instead of silently losing
@@ -1446,10 +1694,21 @@ class FaissVectorDBStorage(BaseVectorStorage):
             await self._flush_pending_locked()
 
             async def _committed() -> None:
-                self._unsaved_deletes.clear()  # the removals are durable now
-                self._unsaved_upserts.clear()  # the rows are durable now
                 await set_all_update_flags(self.namespace, workspace=self.workspace)
                 self.storage_updated.value = False
+                # Retired only PAST the publication, never before it. The rows
+                # are durable either way, but a publication that failed leaves
+                # an unnotified peer holding an older whole-file snapshot, and
+                # that peer can become the next writer and save it over these
+                # rows. Keeping the redo logs makes that recoverable: this
+                # process's next flush reloads the foreign snapshot and replays
+                # them on top (the same path issue #3688 built), so the rows
+                # come back instead of being lost silently. Retiring them first
+                # threw away the only copy. Replay is idempotent -- an
+                # unchanged file matches by fingerprint and writes nothing, and
+                # a genuinely newer row under the same id supersedes ours.
+                self._unsaved_deletes.clear()  # the removals are durable now
+                self._unsaved_upserts.clear()  # the rows are durable now
                 self._index_dirty = False
 
             await self._save_faiss_index(_committed)
@@ -1705,12 +1964,13 @@ class FaissVectorDBStorage(BaseVectorStorage):
         """Drop all vector data from storage and reinitialize the index.
 
         This method will:
-            1. Reset ``self._index`` to a fresh ``IndexFlatIP`` and clear
-               ``self._id_to_meta``.
-            2. Remove both on-disk files (``.index`` and ``.meta.json``)
+            1. Remove both on-disk files (``.index`` and ``.meta.json``)
                if they exist.
+            2. Reset ``self._index`` to a fresh ``IndexFlatIP`` and clear
+               ``self._id_to_meta``.
             3. Notify other processes via ``set_all_update_flags`` and
-               reset the writer's own flag.
+               point the writer's own flag at the snapshot step 2 left
+               behind.
 
         Caller contract:
             ``drop`` is destructive and **not** serialized by this storage
@@ -1724,44 +1984,185 @@ class FaissVectorDBStorage(BaseVectorStorage):
         Returns:
             dict[str, str]: Operation status and message
             - On success: {"status": "success", "message": "data dropped"}
-            - On failure: {"status": "error", "message": "<error details>"}
+            - On destructive failure: {"status": "error", "message": "<error details>"}
+
+            The status reports the durable file removal only. Both removals are
+            part of it: this backend keeps two independent files, so a failure
+            between them leaves one behind — a genuinely partial destruction
+            that must keep reporting ``"error"``. No step after both removals
+            — notification, writer-flag reset, or the success log — can turn
+            the completed destruction into an error response. A peer
+            reload-notification failure after BOTH files are gone is logged as
+            partial propagation and does not turn the completed destruction
+            into an error —
+            ``/documents/clear`` uses this status to decide whether the input
+            files are safe to delete, so reporting a drop that already happened
+            as failed leaves those files ready to be re-ingested against
+            storage that no longer matches. The same holds for every other step
+            that follows the removal: each is guarded on its own, so no step
+            past the point of no return can return ``"error"``.
+            Success confirms durable deletion, not convergence of all worker
+            snapshots. A worker that missed the notification may later write its
+            stale index back. Stop workspace writes and restart affected workers
+            before resuming; if stale data has already been written, clear
+            again.
+            Accepted residue: if the empty-index allocation itself fails, this
+            process keeps the previous ``self._index``. Its ``_id_to_meta`` is
+            cleared first, unconditionally, so no read path reports the dropped
+            rows — including the synchronous ``client_storage``, which bypasses
+            ``_get_index`` and so is not covered by the flag. The writer reload
+            flag is then left SET rather than cleared, so the next
+            ``_get_index`` rebuilds the snapshot from the removed files.
+
+        Cancellation:
+            Before submission, cancellation leaves storage unchanged — the
+            buffers and both redo logs are discarded only after both files are
+            gone. Once deletion is submitted, the storage lock stays held until
+            deletion and its notification/reset/logging hook finish, then caller
+            cancellation propagates. Notification errors are still logged.
         """
+
+        def _delete_files() -> None:
+            # Remove storage files if they exist. Both removals stay in the
+            # destructive phase: the pair is what a drop destroys, and a
+            # failure on the second one must not be reported as a completed
+            # drop just because the first one landed.
+            if os.path.exists(self._faiss_index_file):
+                os.remove(self._faiss_index_file)
+            if os.path.exists(self._meta_file):
+                os.remove(self._meta_file)
+
+        async def _committed() -> None:
+            # Discard buffered (unflushed) upserts, queued deletes and
+            # both redo logs along with the data.
+            self._pending_upserts.clear()
+            self._pending_deletes.clear()
+            self._unsaved_deletes.clear()
+            self._unsaved_upserts.clear()
+
+            # Reset the in-memory snapshot to the post-drop state directly.
+            # No ``_load_faiss_index`` re-parse: ``_storage_lock`` spans
+            # processes and both files were removed inside it, so that call
+            # could only take its absent-index early return — one spurious
+            # "No existing Faiss index file found" warning per successful
+            # clear, and nothing else. Kept on the event loop: mutating
+            # ``self._index`` / ``self._id_to_meta`` off the loop would break
+            # concurrency invariant (3) in the class docstring.
+            #
+            # Guarded like every other post-removal step: the files are already
+            # gone, so nothing here may report the completed destruction as
+            # failed.
+            #
+            # Order matters. The metadata clear goes FIRST, ahead of the
+            # fallible index allocation, because the reload flag set below
+            # cannot protect it: ``client_storage`` reads ``_id_to_meta``
+            # synchronously and deliberately does NOT go through
+            # ``_get_index``, and ``aexport_data`` reads that property. Were
+            # the allocation to raise with the clear behind it, an export
+            # taken before some other async read triggered the reload would
+            # still list rows this drop reported as deleted. Clearing first
+            # cannot fail, so no read path can expose them.
+            self._id_to_meta = {}
+            # No unsaved changes to protect either: the files are gone and the
+            # redo logs are empty, so a stale index must never be saved back.
+            self._index_dirty = False
+            snapshot_reset = False
+            try:
+                self._index = faiss.IndexFlatIP(self._dim)
+                snapshot_reset = True
+            except Exception as snapshot_error:
+                log_without_raising(
+                    logger.error,
+                    f"[{self.workspace}] Dropped FAISS index {self.namespace}, but "
+                    "failed to allocate the empty index; the previous one is "
+                    "still held. Its metadata is already cleared, so no read "
+                    "path reports the dropped rows, and the writer reload flag "
+                    "is left set below so the next read rebuilds it from the "
+                    f"removed files: {snapshot_error}",
+                )
+
+            # Mirror that decision on the file channel, and BEFORE the
+            # fallible manager writes below: a plain attribute assignment
+            # cannot fail with the manager, so the fence holds even when the
+            # flag write does not. Adopting the files' absence when the
+            # allocation installed the post-drop index; invalidating (``None``
+            # differs from any real pair, present or absent) when it did not,
+            # so the next read rebuilds the stale index through this channel
+            # too.
+            if snapshot_reset:
+                self._record_fingerprint()
+            else:
+                self._loaded_fingerprint = None
+
+            # Keep publication under the storage lock. Once deletion starts,
+            # commit_in_storage_io defers caller cancellation through this hook
+            # so it cannot release readers before the notification attempt.
+            try:
+                await set_all_update_flags(self.namespace, workspace=self.workspace)
+            except Exception as notification_error:
+                # Notification can fail partway through the registered flags.
+                # A missed worker may later become the writer and save its
+                # stale index over the deleted files, resurrecting dropped
+                # vectors. A notification from that writer would spread the
+                # stale state, not repair it.
+                log_without_raising(
+                    logger.error,
+                    f"[{self.workspace}] Dropped FAISS index {self.namespace}, but "
+                    "failed while notifying all processes; some processes may not "
+                    "reload and may restore deleted data if they later write. Stop "
+                    "workspace writes and restart all affected workers before "
+                    f"resuming: {notification_error}",
+                )
+            # Point the writer's own flag at the snapshot we actually hold: no
+            # self-reload when the reset above installed the post-drop index, a
+            # self-reload when it did not, so a stale index is rebuilt from the
+            # removed files instead of being served. Unlike the notification, a
+            # failure here is harmless in the common case: both files are gone
+            # and both redo logs are empty, so the reload it would trigger just
+            # re-reads absent files into the empty index we already hold. Report
+            # it, and never let it misclassify the durable deletion as failed.
+            try:
+                self.storage_updated.value = not snapshot_reset
+            except Exception as reset_error:
+                log_without_raising(
+                    logger.error,
+                    f"[{self.workspace}] Dropped FAISS index {self.namespace}, but "
+                    "failed to set the writer reload flag; a redundant reload of "
+                    f"the now-empty index may follow: {reset_error}",
+                )
+            # Log inside the cancellation-protected hook: the caller may receive
+            # CancelledError after it completes instead of a success response.
+            # Routed through log_without_raising like every other log call in
+            # this hook: a broken log sink cannot unmake the removal, so it
+            # must not surface as a failed drop. See that helper for why the
+            # failure is swallowed rather than re-reported.
+            log_without_raising(
+                logger.info,
+                f"[{self.workspace}] Process {os.getpid()} drop FAISS index {self.namespace}",
+            )
+
         try:
             async with self._storage_lock:
-                # Discard buffered (unflushed) upserts, queued deletes and
-                # both redo logs along with the data.
-                self._pending_upserts.clear()
-                self._pending_deletes.clear()
-                self._unsaved_deletes.clear()
-                self._unsaved_upserts.clear()
-
-                # Reset the index
-                self._index = faiss.IndexFlatIP(self._dim)
-                self._id_to_meta = {}
-
-                # Remove storage files if they exist
-                if os.path.exists(self._faiss_index_file):
-                    os.remove(self._faiss_index_file)
-                if os.path.exists(self._meta_file):
-                    os.remove(self._meta_file)
-
-                self._id_to_meta = {}
-                self._load_faiss_index()
-                self._index_dirty = False
-
-                # Notify other processes
-                await set_all_update_flags(self.namespace, workspace=self.workspace)
-                self.storage_updated.value = False
-
-                logger.info(
-                    f"[{self.workspace}] Process {os.getpid()} drop FAISS index {self.namespace}"
-                )
-            return {"status": "success", "message": "data dropped"}
+                await commit_in_storage_io(_delete_files, _committed)
+        except CommitBookkeepingError as e:
+            # The files are already gone; only the post-removal bookkeeping
+            # failed. Every step of `_committed` guards itself, so nothing raises
+            # this today -- it is the standing answer for a future step that
+            # forgets to, because "error" for a completed destruction is
+            # precisely the misreport those guards exist to prevent.
+            log_without_raising(
+                logger.error,
+                f"[{self.workspace}] Dropped FAISS index {self.namespace}, but "
+                f"its post-removal bookkeeping failed: {e.__cause__}",
+            )
         except Exception as e:
-            logger.error(
-                f"[{self.workspace}] Error dropping FAISS index {self.namespace}: {e}"
+            log_without_raising(
+                logger.error,
+                f"[{self.workspace}] Error dropping FAISS index {self.namespace}: {e}",
             )
             return {"status": "error", "message": str(e)}
+
+        return {"status": "success", "message": "data dropped"}
 
     async def finalize(self):
         """Flush buffered upserts/deletes and persist before shutdown (safety net).
@@ -1834,10 +2235,21 @@ class FaissVectorDBStorage(BaseVectorStorage):
                 return
 
             async def _committed() -> None:
-                self._unsaved_deletes.clear()  # the removals are durable now
-                self._unsaved_upserts.clear()  # the rows are durable now
                 await set_all_update_flags(self.namespace, workspace=self.workspace)
                 self.storage_updated.value = False
+                # Retired only PAST the publication, never before it. The rows
+                # are durable either way, but a publication that failed leaves
+                # an unnotified peer holding an older whole-file snapshot, and
+                # that peer can become the next writer and save it over these
+                # rows. Keeping the redo logs makes that recoverable: this
+                # process's next flush reloads the foreign snapshot and replays
+                # them on top (the same path issue #3688 built), so the rows
+                # come back instead of being lost silently. Retiring them first
+                # threw away the only copy. Replay is idempotent -- an
+                # unchanged file matches by fingerprint and writes nothing, and
+                # a genuinely newer row under the same id supersedes ours.
+                self._unsaved_deletes.clear()  # the removals are durable now
+                self._unsaved_upserts.clear()  # the rows are durable now
                 self._index_dirty = False
 
             await self._save_faiss_index(_committed)
