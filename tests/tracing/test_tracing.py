@@ -35,7 +35,6 @@ All tests work offline (no real LLM / Langfuse network calls).
 
 from __future__ import annotations
 
-import asyncio
 import os
 import pathlib
 from typing import Any
@@ -239,7 +238,8 @@ class TestLfFlushAndShutdown:
 
 class TestLfObserveDecorator:
 
-    def test_passthrough_when_disabled(self):
+    @pytest.mark.asyncio
+    async def test_passthrough_when_disabled(self):
         with patch("lightrag.tracing.is_tracing_enabled", return_value=False):
             from lightrag.tracing import lf_observe
 
@@ -247,18 +247,16 @@ class TestLfObserveDecorator:
             async def _fn():
                 return 42
 
-        result = asyncio.get_event_loop().run_until_complete(_fn())
+        result = await _fn()
         assert result == 42
 
     def test_wraps_with_observe_when_enabled(self):
         mock_observe = MagicMock(side_effect=lambda **kw: lambda f: f)
         with patch("lightrag.tracing.is_tracing_enabled", return_value=True), \
              patch.dict("sys.modules", {"langfuse": MagicMock(observe=mock_observe)}):
-            from lightrag import tracing as tr
-            import importlib
-            importlib.reload(tr)
+            from lightrag.tracing import lf_observe
 
-            @tr.lf_observe(name="x")
+            @lf_observe(name="x")
             async def _fn():
                 return 1
 
@@ -681,10 +679,12 @@ class TestMergeNodesAndEdgesTracing:
 class TestPipelineTracing:
 
     def test_process_single_document_decorated_with_lf_observe(self):
-        import pathlib
-        src = (pathlib.Path(__file__).parents[2] / "lightrag" / "pipeline.py").read_text()
-        assert "index-document" in src
-        assert "lf_observe" in src
+        import inspect
+        from lightrag.pipeline import _PipelineMixin
+
+        src = inspect.getsource(_PipelineMixin.process_single_document)
+        assert "@lf_observe" in src
+        assert 'name="index-document"' in src
 
     def test_process_single_document_calls_lf_update_current_span(self):
         import inspect
@@ -693,14 +693,98 @@ class TestPipelineTracing:
         assert "lf_update_current_span" in src
 
     def test_batch_sub_tasks_wrapped_with_lf_propagate_attributes(self):
-        import pathlib
-        src = (pathlib.Path(__file__).parents[2] / "lightrag" / "pipeline.py").read_text()
+        import inspect
+        from lightrag.pipeline import _PipelineMixin
+
+        src = inspect.getsource(_PipelineMixin._process_worker)
         assert "lf_propagate_attributes" in src
 
     def test_process_single_document_is_callable(self):
         from lightrag.pipeline import _PipelineMixin
         method = getattr(_PipelineMixin, "process_single_document", None)
         assert method is not None and callable(method)
+
+    def test_process_worker_wraps_dispatch_with_session_and_trace_name(self):
+        """Each dispatch to process_single_document must be wrapped with a
+        per-document Langfuse context — session_id/trace_name derived from
+        that document's own status_doc, not a batch-level value."""
+        import inspect
+        from lightrag.pipeline import _PipelineMixin
+        src = inspect.getsource(_PipelineMixin._process_worker)
+        assert "lf_propagate_attributes" in src
+        assert "session_id=" in src
+        assert "trace_name=" in src
+
+    def test_doc_display_name_uses_file_path_basename_or_falls_back_to_doc_id(self):
+        from lightrag.pipeline_observability import _doc_display_name
+
+        status_doc = MagicMock(file_path="/data/inputs/report.pdf")
+        assert _doc_display_name(status_doc, "doc-123") == "report.pdf"
+
+        status_doc_no_path = MagicMock(file_path="")
+        assert _doc_display_name(status_doc_no_path, "doc-123") == "doc-123"
+
+    def test_track_id_prefix_extracts_route_and_falls_back_to_unknown(self):
+        from lightrag.pipeline_observability import _track_id_prefix
+
+        assert _track_id_prefix("scan_20250729_170612_abc123") == "scan"
+        assert _track_id_prefix("texts_20250729_170612_abc123") == "texts"
+        # Prefix may itself contain a hyphen; only the first "_" splits.
+        assert _track_id_prefix("foo-bar_20250729_170612_abc123") == "foo-bar"
+        assert _track_id_prefix(None) == "unknown"
+        assert _track_id_prefix("") == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_two_documents_in_one_batch_get_distinct_propagate_attributes_calls(self):
+        """Two documents drained from the same q_process (as happens when a
+        scan or /documents/texts enqueues several docs under one track_id)
+        must each open their OWN lf_propagate_attributes context — distinct
+        trace_name per document, but the SAME session_id when they share a
+        track_id (the batch case), proving traces stay separate while still
+        being groupable as one Langfuse Session."""
+        import asyncio as _asyncio
+        from lightrag.pipeline import _PipelineMixin
+
+        calls: list[dict[str, Any]] = []
+
+        class _RecordingCM:
+            def __init__(self, **kwargs):
+                calls.append(kwargs)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        def _fake_propagate_attributes(**kwargs):
+            return _RecordingCM(**kwargs)
+
+        status_doc_a = MagicMock(track_id="texts_20250101_000000_aaa", file_path="doc-a.txt")
+        status_doc_b = MagicMock(track_id="texts_20250101_000000_aaa", file_path="doc-b.txt")
+
+        mixin = _PipelineMixin()
+        mixin.workspace = "default"
+        mixin.process_single_document = AsyncMock()
+
+        ctx = MagicMock()
+        ctx.q_process = _asyncio.Queue()
+        ctx.q_process.put_nowait(("doc-a", status_doc_a, {}))
+        ctx.q_process.put_nowait(("doc-b", status_doc_b, {}))
+
+        with patch("lightrag.pipeline.lf_propagate_attributes", side_effect=_fake_propagate_attributes):
+            worker_task = _asyncio.create_task(mixin._process_worker(ctx))
+            await ctx.q_process.join()
+            worker_task.cancel()
+            with pytest.raises(_asyncio.CancelledError):
+                await worker_task
+
+        assert len(calls) == 2
+        assert calls[0]["trace_name"] == "index-document: doc-a.txt"
+        assert calls[1]["trace_name"] == "index-document: doc-b.txt"
+        assert calls[0]["session_id"] == calls[1]["session_id"] == "texts_20250101_000000_aaa"
+        assert "route:texts" in calls[0]["tags"]
+        assert "route:texts" in calls[1]["tags"]
 
 
 # ---------------------------------------------------------------------------
@@ -722,11 +806,30 @@ class TestQueryRouteDecorators:
         assert "lf_propagate_attributes" in src
         assert "lf_update_current_span" in src
 
-    def test_document_routes_no_longer_use_lf_observe(self):
+    def test_document_routes_delegate_trace_shaping_to_pipeline(self):
+        """document_routes.py used to own trace shape (trace_name/tags) for
+        each ingestion route. That moved to pipeline.py's _process_worker,
+        which opens one Langfuse trace per document, session-grouped by that
+        document's own track_id — a route-level wrap would just be shadowed
+        by the inner per-document context, so routes no longer open or shape
+        Langfuse traces at all. lf_flush() (unrelated to trace shape — just
+        flushes buffered spans before a background task exits) still remains.
+        """
         src = (_routers_dir() / "document_routes.py").read_text()
         assert "lf_observe" not in src
-        assert "lf_propagate_attributes" in src
-        assert "lf_update_current_span" in src
+        assert "lf_propagate_attributes" not in src
+        assert "lf_start_as_current_observation" not in src
+        assert "lf_update_current_span" not in src
+        assert "lf_flush" in src
+
+    def test_document_routes_no_longer_name_traces_by_route(self):
+        """Trace naming is standardized to f'index-document: <name>' in
+        pipeline.py — no route handler should set its own trace_name."""
+        src = (_routers_dir() / "document_routes.py").read_text()
+        assert 'trace_name="documents/scan"' not in src
+        assert 'trace_name="documents/upload"' not in src
+        assert 'trace_name="documents/text"' not in src
+        assert 'trace_name="documents/texts"' not in src
 
 
 # ---------------------------------------------------------------------------

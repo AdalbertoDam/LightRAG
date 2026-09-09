@@ -123,12 +123,7 @@ from lightrag.utils import (
 from lightrag.kg.shared_storage import append_pipeline_history
 from lightrag.utils_pipeline import count_active_documents, read_source_file_basename
 from lightrag.api.admission import adopt_admission_ticket
-from lightrag.tracing import (
-    lf_propagate_attributes,
-    lf_flush,
-    lf_update_current_span,
-    lf_start_as_current_observation,
-)
+from lightrag.tracing import lf_flush
 from lightrag.api.utils_api import get_combined_auth_dependency
 from ..config import global_args
 
@@ -3952,12 +3947,7 @@ async def run_scanning_process(
         # that always runs the queue regardless of how documents got there
         # (new enqueue, resume target, or exclusive FAILED reset).
         queue_drive_attempted = True
-        async with lf_propagate_attributes(
-            trace_name="documents/scan",
-            tags=["scan", "indexing"],
-            metadata={"track_id": track_id, "discovered": discovered, "workspace": rag.workspace},
-        ):
-            await rag.apipeline_process_enqueue_documents()
+        await rag.apipeline_process_enqueue_documents()
 
         summary = (
             f"Scanning process completed: {discovered} discovered, "
@@ -4049,6 +4039,7 @@ async def run_scanning_process(
                     job_message = f"Post-scan queue drive failed: {drive_error}"
                     reporter.sample("error", job_message)
 
+        lf_flush()
         # The heartbeat has covered every phase including the deferred drive
         # above; stop it before the terminal transition so the record's last
         # write is the terminal one. Not awaited: the cancellation path must not
@@ -5427,23 +5418,16 @@ def create_document_routes(
                 # start-barrier confirms takeover before returning; a body-send
                 # cancellation therefore cannot strand the enqueue slot.
                 started.set()
-                async with lf_propagate_attributes(
-                    tags=["upload", "indexing"],
-                    metadata={
-                        "workspace": rag.workspace,
-                    },
-                    trace_name="documents/upload"
-                ):
-                    try:
-                        await pipeline_index_file(
-                            rag,
-                            file_path,
-                            track_id,
-                            admission_token=enqueue_token,
-                        )
-                    finally:
-                        await _release_enqueue_slot(rag, enqueue_token)
-                        lf_flush()
+                try:
+                    await pipeline_index_file(
+                        rag,
+                        file_path,
+                        track_id,
+                        admission_token=enqueue_token,
+                    )
+                finally:
+                    await _release_enqueue_slot(rag, enqueue_token)
+                    lf_flush()
 
             async def _enqueue_backstop():
                 await _release_enqueue_slot(rag, enqueue_token)
@@ -5524,8 +5508,6 @@ def create_document_routes(
             if not admission_adopted:
                 await _reserve_enqueue_slot(rag, enqueue_token)
 
-            lf_update_current_span(input={"file_source": request.file_source})
-
             # Check if file_source already exists in doc_status storage
             if not is_valid_file_source(request.file_source):
                 raise HTTPException(
@@ -5565,56 +5547,26 @@ def create_document_routes(
                 )
 
             # Generate track_id for text insertion
-            track_id = generate_track_id("insert")
+            track_id = generate_track_id("text")
 
             async def _indexing_work(started):
                 # started.set() first (no await before it) so the endpoint's
                 # start-barrier confirms takeover before returning; a body-send
                 # cancellation therefore cannot strand the enqueue slot.
                 started.set()
-                # A dedicated span is opened here (inside the background task)
-                # rather than relying solely on the middleware's "insert-text"
-                # span: start_reserved_background_task returns as soon as
-                # started.set() fires, so the HTTP response — and with it the
-                # middleware span — completes almost immediately, well before
-                # pipeline_index_texts actually runs. Setting output= on an
-                # already-ended span silently no-ops, so this span's own
-                # lifetime is tied to the task instead.
-                async with lf_start_as_current_observation(
-                    name="documents/text",
-                    metadata={
-                        "document_count": 1,
-                        "text_snippet": request.text[:10],
-                        "file_source": normalized_file_source,
-                        "workspace": rag.workspace,
-                    },
-                ):
-                    async with lf_propagate_attributes(
-                        tags=["insert-text", "indexing"],
-                        metadata={
-                            "document_count": "1",
-                            "text_snippet": request.text[:10],
-                            "file_source": normalized_file_source,
-                            "workspace": rag.workspace,
-                        },
-                        trace_name="documents/text"
-                    ):
-                        try:
-                            await pipeline_index_texts(
-                                rag,
-                                [request.text],
-                                file_sources=[normalized_file_source],
-                                track_id=track_id,
-                                chunking=request.chunking,
-                                resolved_chunking=resolved_chunking,
-                                admission_token=enqueue_token,
-                            )
-                            lf_update_current_span(
-                                output={"status": "success", "document_count": 1}
-                            )
-                        finally:
-                            await _release_enqueue_slot(rag, enqueue_token)
-                            lf_flush()
+                try:
+                    await pipeline_index_texts(
+                        rag,
+                        [request.text],
+                        file_sources=[normalized_file_source],
+                        track_id=track_id,
+                        chunking=request.chunking,
+                        resolved_chunking=resolved_chunking,
+                        admission_token=enqueue_token,
+                    )
+                finally:
+                    await _release_enqueue_slot(rag, enqueue_token)
+                    lf_flush()
 
             async def _enqueue_backstop():
                 await _release_enqueue_slot(rag, enqueue_token)
@@ -5760,14 +5712,7 @@ def create_document_routes(
             await _reweight_enqueue_slot(rag, enqueue_token, len(request.texts))
 
             # Generate track_id for texts insertion
-            track_id = generate_track_id("insert")
-
-            lf_update_current_span(
-                input={
-                    "file_sources": normalized_file_sources,
-                    "document_count": len(request.texts),
-                }
-            )
+            track_id = generate_track_id("texts")
 
             async def _indexing_work(started):
                 # started.set() first (no await before it) so the endpoint's
@@ -5775,28 +5720,19 @@ def create_document_routes(
                 # cancellation therefore cannot strand the enqueue slot.
                 started.set()
 
-                async with lf_propagate_attributes(
-                    tags=["insert-texts", "indexing"],
-                    metadata={
-                        "document_count": str(len(request.texts)),
-                        "file_sources": ", ".join(normalized_file_sources)[:200],
-                        "workspace": rag.workspace,
-                    },
-                    trace_name="documents/texts"
-                ):
-                    try:
-                        await pipeline_index_texts(
-                            rag,
-                            request.texts,
-                            file_sources=normalized_file_sources,
-                            track_id=track_id,
-                            chunking=request.chunking,
-                            resolved_chunking=resolved_chunking,
-                            admission_token=enqueue_token,
-                        )
-                    finally:
-                        await _release_enqueue_slot(rag, enqueue_token)
-                        lf_flush()
+                try:
+                    await pipeline_index_texts(
+                        rag,
+                        request.texts,
+                        file_sources=normalized_file_sources,
+                        track_id=track_id,
+                        chunking=request.chunking,
+                        resolved_chunking=resolved_chunking,
+                        admission_token=enqueue_token,
+                    )
+                finally:
+                    await _release_enqueue_slot(rag, enqueue_token)
+                    lf_flush()
 
             async def _enqueue_backstop():
                 await _release_enqueue_slot(rag, enqueue_token)

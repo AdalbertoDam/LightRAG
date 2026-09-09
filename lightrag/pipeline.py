@@ -78,6 +78,7 @@ from lightrag.kg.shared_storage import (
 from lightrag import pipeline_metrics
 from lightrag.kg.pipeline_ingress import PipelineIngressMessage
 from lightrag.operate import merge_nodes_and_edges
+from lightrag.pipeline_observability import _doc_display_name, _track_id_prefix
 from lightrag.parser.base import ParseContext
 from lightrag.parser.exceptions import (
     ParsePipelineCancelled,
@@ -121,6 +122,7 @@ from lightrag.utils import (
 )
 from lightrag.tracing import (
     lf_observe,
+    lf_propagate_attributes,
     lf_start_as_current_observation,
     lf_update_current_span,
 )
@@ -4722,12 +4724,33 @@ class _PipelineMixin:
             item = await ctx.q_process.get()
             try:
                 doc_id_w, status_doc_w, parsed_data_w = item
-                await self.process_single_document(
-                    doc_id=doc_id_w,
-                    status_doc=status_doc_w,
-                    parsed_data=parsed_data_w,
-                    ctx=ctx,
-                )
+                # One Langfuse trace per document, grouped into a Session by
+                # this document's own track_id (stamped at enqueue time).
+                # Opened at the CALL SITE, not inside process_single_document's
+                # body: @lf_observe creates
+                # the span/trace at call time, reading whatever
+                # session_id/tags/trace_name context vars are active right
+                # now — setting them from inside the function body would be
+                # too late to influence the trace it already created.
+                async with lf_propagate_attributes(
+                    trace_name=f"index-document: {_doc_display_name(status_doc_w, doc_id_w)}",
+                    session_id=status_doc_w.track_id,
+                    tags=[
+                        "ingestion",
+                        "index-document",
+                        f"route:{_track_id_prefix(status_doc_w.track_id)}",
+                    ],
+                    metadata={
+                        "workspace": self.workspace,
+                        "track_id": status_doc_w.track_id,
+                    },
+                ):
+                    await self.process_single_document(
+                        doc_id=doc_id_w,
+                        status_doc=status_doc_w,
+                        parsed_data=parsed_data_w,
+                        ctx=ctx,
+                    )
             except Exception as e:
                 # process_single_document handles its own per-doc failures; an
                 # escape here means even the FAILED-status write failed (e.g.

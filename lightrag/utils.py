@@ -6925,6 +6925,9 @@ def parse_relation_chunk_key(key: str) -> tuple[str, str]:
 def generate_track_id(prefix: str = "upload") -> str:
     """Generate a unique tracking ID with timestamp and UUID
 
+    In this fork, the prefix is used to obtain a route-level
+    tag on langfuse traces (see its usage in document_routes.py).
+
     Args:
         prefix: Prefix for the track ID (e.g., 'upload', 'insert')
 
