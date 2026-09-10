@@ -831,6 +831,37 @@ class TestMongoEdgeKey:
 
     @pytest.mark.asyncio
     async def test_edge_migration_skips_when_index_exists(self):
+        """Once every index (unique endpoints + the two single-field degree
+        indexes) already exists, re-running is a pure no-op: no migration
+        aggregate, no redundant create_index calls."""
+        s = self._make_storage()
+        s.edge_collection.list_indexes = AsyncMock(
+            return_value=SimpleNamespace(
+                to_list=AsyncMock(
+                    return_value=[
+                        {"name": "test_edge_endpoints_unique"},
+                        {"name": "test_source_node_id"},
+                        {"name": "test_target_node_id"},
+                    ]
+                )
+            )
+        )
+        s.edge_collection.aggregate = AsyncMock()
+        s.edge_collection.create_index = AsyncMock()
+
+        await s.create_edge_indexes_and_migrate_if_not_exists()
+
+        s.edge_collection.aggregate.assert_not_awaited()
+        s.edge_collection.create_index.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_edge_migration_backfills_degree_indexes_on_already_migrated_edges(
+        self,
+    ):
+        """The source_node_id/target_node_id degree indexes are ensured
+        unconditionally, independent of the unique-endpoints migration state —
+        an already-migrated deployment (pre-dating these two indexes) must
+        still pick them up, without re-running the dedupe/backfill migration."""
         s = self._make_storage()
         s.edge_collection.list_indexes = AsyncMock(
             return_value=SimpleNamespace(
@@ -842,8 +873,15 @@ class TestMongoEdgeKey:
 
         await s.create_edge_indexes_and_migrate_if_not_exists()
 
+        # Unique-endpoints migration already complete: no dedupe/backfill pass.
         s.edge_collection.aggregate.assert_not_awaited()
-        s.edge_collection.create_index.assert_not_awaited()
+        # But the two missing degree indexes are still (idempotently) created.
+        assert s.edge_collection.create_index.await_count == 2
+        created_names = {
+            call.kwargs.get("name")
+            for call in s.edge_collection.create_index.await_args_list
+        }
+        assert created_names == {"test_source_node_id", "test_target_node_id"}
 
     @pytest.mark.asyncio
     async def test_edge_migration_dedupes_backfills_and_builds_unique_index(self):

@@ -2280,6 +2280,19 @@ class MongoGraphStorage(BaseGraphStorage):
     async def edge_degrees_batch(
         self, edge_pairs: list[tuple[str, str]]
     ) -> dict[tuple[str, str], int]:
+        """
+        Calculate the combined degree for each edge (sum of the source and target node degrees)
+        in batch using the already implemented node_degrees_batch.
+
+        Args:
+            edge_pairs: List of (source_node_id, target_node_id) tuples
+
+        Returns:
+            Dictionary mapping edge tuples to their combined degrees
+        """
+        if not edge_pairs:
+            return {}
+
         # Node degrees are already batched; sum them locally instead of
         # issuing one edge_degree() round-trip per pair.
         node_ids = {node_id for pair in edge_pairs for node_id in pair}
@@ -2287,14 +2300,25 @@ class MongoGraphStorage(BaseGraphStorage):
 
         result = {}
         for src_id, tgt_id in edge_pairs:
-            result[(src_id, tgt_id)] = degrees.get(src_id, 0) + degrees.get(
-                tgt_id, 0
-            )
+            result[(src_id, tgt_id)] = degrees.get(src_id, 0) + degrees.get(tgt_id, 0)
         return result
 
     async def get_edges_batch(
         self, pairs: list[dict[str, str]]
     ) -> dict[tuple[str, str], dict]:
+        """
+        Retrieve edge properties for multiple (src, tgt) pairs in one query.
+
+        Args:
+            pairs: List of dictionaries, e.g. [{"src": "node1", "tgt": "node2"}, ...]
+
+        Returns:
+            A dictionary mapping existing (src, tgt) tuples to their edge
+            properties. Missing pairs are omitted.
+        """
+        if not pairs:
+            return {}
+
         # Map canonical (edge_lo, edge_hi) back to the requested (src, tgt)
         # direction, since multiple requested pairs can share one canonical edge.
         canonical_to_requested: dict[tuple[str, str], list[tuple[str, str]]] = {}
@@ -2302,14 +2326,9 @@ class MongoGraphStorage(BaseGraphStorage):
             src_id = pair["src"]
             tgt_id = pair["tgt"]
             canonical = _canonical_edge_endpoints(src_id, tgt_id)
-            canonical_to_requested.setdefault(canonical, []).append(
-                (src_id, tgt_id)
-            )
+            canonical_to_requested.setdefault(canonical, []).append((src_id, tgt_id))
 
         result = {}
-        if not canonical_to_requested:
-            return result
-
         cursor = self.edge_collection.find(
             {
                 "$or": [
