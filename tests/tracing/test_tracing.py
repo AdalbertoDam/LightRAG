@@ -780,8 +780,10 @@ class TestPipelineTracing:
                 await worker_task
 
         assert len(calls) == 2
-        assert calls[0]["trace_name"] == "index-document: doc-a.txt"
-        assert calls[1]["trace_name"] == "index-document: doc-b.txt"
+        assert calls[0]["trace_name"] == "index-document"
+        assert calls[1]["trace_name"] == "index-document"
+        assert calls[0]["metadata"]["filename"] == "doc-a.txt"
+        assert calls[1]["metadata"]["filename"] == "doc-b.txt"
         assert calls[0]["session_id"] == calls[1]["session_id"] == "texts_20250101_000000_aaa"
         assert "route:texts" in calls[0]["tags"]
         assert "route:texts" in calls[1]["tags"]
@@ -823,8 +825,9 @@ class TestQueryRouteDecorators:
         assert "lf_flush" in src
 
     def test_document_routes_no_longer_name_traces_by_route(self):
-        """Trace naming is standardized to f'index-document: <name>' in
-        pipeline.py — no route handler should set its own trace_name."""
+        """Trace naming is standardized to a constant 'index-document' in
+        pipeline.py (with the filename carried as trace metadata, not baked
+        into the name) — no route handler should set its own trace_name."""
         src = (_routers_dir() / "document_routes.py").read_text()
         assert 'trace_name="documents/scan"' not in src
         assert 'trace_name="documents/upload"' not in src

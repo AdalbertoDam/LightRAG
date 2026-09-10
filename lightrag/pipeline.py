@@ -4733,7 +4733,7 @@ class _PipelineMixin:
                 # now — setting them from inside the function body would be
                 # too late to influence the trace it already created.
                 async with lf_propagate_attributes(
-                    trace_name=f"index-document: {_doc_display_name(status_doc_w, doc_id_w)}",
+                    trace_name="index-document",
                     session_id=status_doc_w.track_id,
                     tags=[
                         "ingestion",
@@ -4743,6 +4743,7 @@ class _PipelineMixin:
                     metadata={
                         "workspace": self.workspace,
                         "track_id": status_doc_w.track_id,
+                        "filename": _doc_display_name(status_doc_w, doc_id_w),
                     },
                 ):
                     await self.process_single_document(
