@@ -4248,6 +4248,7 @@ async def extract_entities(
                 span_name="entity-relation-extraction-llm",
                 span_metadata={
                     "chunk_id": chunk_key,
+                    "chunk_content": content,
                 },
             )
 
@@ -4331,6 +4332,7 @@ async def extract_entities(
                     span_name="entity-relation-extraction-gleaning-llm",
                     span_metadata={
                         "chunk_id": chunk_key,
+                        "chunk_content": content,
                     },
                 )
 
