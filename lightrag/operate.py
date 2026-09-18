@@ -4879,6 +4879,24 @@ async def kg_query(
 
     # Handle cache
     answer_cache_kv = _answer_cache_kv(query_param, hashing_kv)
+    # The chunk-selection settings must be read from the STORAGE snapshot, not
+    # from the `global_config` parameter, even though the two usually agree.
+    # A storage captures `asdict(self)` once at construction, while `aquery`
+    # rebuilds `global_config` on every call, so the two diverge as soon as the
+    # attribute is mutated on a live LightRAG. The code that actually consumes
+    # these settings (`_find_most_related_text_unit_from_entities` /
+    # `..._from_relationships`) reads the snapshot, so keying on the same dict
+    # the consumer reads is what keeps the key and the retrieved context in
+    # sync. Do NOT "unify" this with the `global_config` reads above.
+    retrieval_config = (
+        text_chunks_db.global_config if text_chunks_db is not None else global_config
+    )
+    related_chunk_number = retrieval_config.get(
+        "related_chunk_number", DEFAULT_RELATED_CHUNK_NUMBER
+    )
+    kg_chunk_pick_method = retrieval_config.get(
+        "kg_chunk_pick_method", DEFAULT_KG_CHUNK_PICK_METHOD
+    )
     args_hash = compute_args_hash(
         _ANSWER_CACHE_POLICY_VERSION,
         query_param.mode,
@@ -4902,6 +4920,11 @@ async def kg_query(
         effective_user_prompt.text,
         query_param.enable_rerank,
         global_config.get("enable_content_headings", False),
+        # Unconditional, and read from `retrieval_config` -- see the comment on
+        # its assignment above for why the source differs from the line above.
+        "\n<kg_chunk_selection>\n",
+        related_chunk_number,
+        kg_chunk_pick_method,
         *(("\n<system_prompt>\n", system_prompt) if system_prompt else ()),
         "\n<llm_identity>\n",
         serialize_llm_cache_identity(llm_cache_identity),
@@ -4961,6 +4984,8 @@ async def kg_query(
                 "enable_content_headings": global_config.get(
                     "enable_content_headings", False
                 ),
+                "related_chunk_number": related_chunk_number,
+                "kg_chunk_pick_method": kg_chunk_pick_method,
             }
             await save_to_cache(
                 answer_cache_kv,
@@ -6352,6 +6377,40 @@ async def _find_most_related_edges_from_entities(
     return all_edges_data
 
 
+def _vector_chunk_quota(max_related_chunks: int, group_count: int) -> int:
+    """How many chunks VECTOR-mode selection may draw, scaled by group count.
+
+    Do not remove the floor of 1: it restores parity with the WEIGHT path,
+    which guarantees at least one chunk per group via
+    ``pick_by_weighted_polling(..., min_related_chunks=1)``. This quota is the
+    same linear-gradient budget as WEIGHT's ``n * (max + 1) / 2`` minus the
+    ``n / 2`` term, so ``(max_related_chunks=1, group_count=1)`` is the single
+    input where VECTOR would otherwise truncate to 0 and drop below that floor.
+    A 0 quota makes ``pick_by_vector_similarity`` return ``[]``, which the call
+    sites read as "vector selection failed" and silently downgrade to WEIGHT.
+
+    The ``max_related_chunks <= 0`` guard is what keeps ``related_chunk_number=0``
+    a genuine kill switch rather than a silent 1; the floor applies only once
+    both inputs are positive.
+
+    The ``group_count <= 0`` branch is defensive only: both call sites already
+    guard on their group list being non-empty (entities_with_chunks /
+    relations_with_chunks) before reaching here, so group_count is always
+    >= 1 in practice.
+
+    Args:
+        max_related_chunks: Configured ``related_chunk_number``; 0 disables
+            KG-related chunk selection entirely.
+        group_count: Number of entity/relation groups that carry chunks.
+
+    Returns:
+        Number of chunks VECTOR selection may draw, 0 when disabled.
+    """
+    if max_related_chunks <= 0 or group_count <= 0:
+        return 0
+    return max(1, int(max_related_chunks * group_count / 2))
+
+
 async def _find_related_text_unit_from_entities(
     node_datas: list[dict],
     query_param: QueryParam,
@@ -6418,6 +6477,24 @@ async def _find_related_text_unit_from_entities(
         # Update entity's chunks to deduplicated chunks
         entity_info["chunks"] = deduplicated_chunks
 
+    # Drop entities emptied by deduplication so they do not inflate the
+    # per-group chunk budget used by the selection strategies.
+    entities_with_chunks = [
+        entity_info for entity_info in entities_with_chunks if entity_info["chunks"]
+    ]
+
+    # Defensive only: unreachable on this path. Deduplication drops a chunk
+    # solely because an earlier-positioned entity already claimed it, so the
+    # first entity keeps every chunk it carries and at least one group always
+    # survives. The relation path's equivalent guard IS reachable, because it
+    # additionally excludes the chunks already delivered by the entity path,
+    # which can empty every relation group.
+    if not entities_with_chunks:
+        logger.info(
+            f"Find no entity-related chunks from {len(node_datas)} entities after deduplication"
+        )
+        return []
+
     # Step 3: Sort chunks for each entity by occurrence count (higher count = higher priority)
     total_entity_chunks = 0
     for entity_info in entities_with_chunks:
@@ -6436,7 +6513,9 @@ async def _find_related_text_unit_from_entities(
     #     The order of text chunks aligns with the naive retrieval's destination.
     #     When reranking is disabled, the text chunks delivered to the LLM tend to favor naive retrieval.
     if kg_chunk_pick_method == "VECTOR" and query and chunks_vdb:
-        num_of_chunks = int(max_related_chunks * len(entities_with_chunks) / 2)
+        num_of_chunks = _vector_chunk_quota(
+            max_related_chunks, len(entities_with_chunks)
+        )
 
         # Get embedding function from global config
         actual_embedding_func = text_chunks_db.embedding_func
@@ -6728,7 +6807,9 @@ async def _find_related_text_unit_from_relations(
     selected_chunk_ids = []  # Initialize to avoid UnboundLocalError
 
     if kg_chunk_pick_method == "VECTOR" and query and chunks_vdb:
-        num_of_chunks = int(max_related_chunks * len(relations_with_chunks) / 2)
+        num_of_chunks = _vector_chunk_quota(
+            max_related_chunks, len(relations_with_chunks)
+        )
 
         # Get embedding function from global config
         actual_embedding_func = text_chunks_db.embedding_func
