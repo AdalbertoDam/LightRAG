@@ -3242,10 +3242,6 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         propagates uncaught: a page failing partway through must not return
         the pages that already succeeded, since callers treat an incomplete
         result as a storage-consistency signal, not a partial one.
-
-        Every blocking pymilvus call (collection load, each page's query) is
-        offloaded via ``asyncio.to_thread`` so a large id list cannot stall
-        the event loop across many gRPC round-trips.
         """
         await self._run_gated(self._ensure_collection_loaded)
 
